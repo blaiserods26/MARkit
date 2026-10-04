@@ -8,9 +8,13 @@ import logging
 import os
 import random
 from typing import Callable, List, Optional
+from dotenv import load_dotenv
 import google.generativeai as genai
 
+load_dotenv()
+
 logger = logging.getLogger(__name__)
+
 
 
 class GeminiKeyRotator:
@@ -18,10 +22,11 @@ class GeminiKeyRotator:
         self.default_model = default_model
         self.keys: List[str] = []
 
-        if keys:
+        if keys is not None:
             self.keys = [k.strip() for k in keys if k and k.strip()]
         else:
             self._load_keys_from_env()
+
 
     def _load_keys_from_env(self) -> None:
         """

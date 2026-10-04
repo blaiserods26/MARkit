@@ -5,11 +5,15 @@ Starts the FastAPI server with live market feeds, agent reasoning, and web dashb
 
 import os
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()
 
 if __name__ == "__main__":
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
+
     print("=" * 65)
     print("  🚀 MARkit: Autonomous Indian Stock Market AI Trading Agent")
     print("  📈 Paper Trading Simulation (Real-Time NSE Feeds)")

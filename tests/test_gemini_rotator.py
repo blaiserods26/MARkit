@@ -7,7 +7,13 @@ def test_load_keys_from_list():
     assert rotator.key_count == 3
     assert set(rotator.keys) == {"KEY_1", "KEY_2", "KEY_3"}
 
+def _clear_gemini_env(monkeypatch):
+    for key in list(os.environ.keys()):
+        if key.startswith("GEMINI_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+
 def test_load_keys_from_env_comma_separated(monkeypatch):
+    _clear_gemini_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEYS", "KEY_A, KEY_B, KEY_C")
     rotator = GeminiKeyRotator()
     assert rotator.key_count == 3
@@ -16,7 +22,7 @@ def test_load_keys_from_env_comma_separated(monkeypatch):
     assert "KEY_C" in rotator.keys
 
 def test_load_keys_from_single_env(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
+    _clear_gemini_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "SINGLE_KEY_123")
     rotator = GeminiKeyRotator()
     assert rotator.key_count == 1
@@ -29,12 +35,12 @@ def test_random_key_distribution():
     assert len(sampled) == 3
 
 def test_empty_keys_fallback(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    _clear_gemini_env(monkeypatch)
     rotator = GeminiKeyRotator(keys=[])
     assert rotator.key_count == 0
     assert rotator.get_random_key() is None
     assert rotator.generate_text("Hello") is None
+
 
 def test_key_rotation_on_failure():
     rotator = GeminiKeyRotator(keys=["KEY_1", "KEY_2"])
