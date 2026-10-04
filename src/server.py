@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from src.agent import ActionType, TradingAgent
 from src.clock import MarketClock
+from src.gemini_rotator import GeminiKeyRotator
 from src.ledger import OrderSide, VirtualLedger
 from src.market_data import MarketDataProvider
 from src.research import NewsResearcher
@@ -26,22 +27,26 @@ market_data_provider = MarketDataProvider()
 virtual_ledger = VirtualLedger(initial_cash=10000.0, persistence_path="data/ledger.json")
 market_clock = MarketClock()
 news_researcher = NewsResearcher()
+gemini_rotator = GeminiKeyRotator()
 trading_agent = TradingAgent(
     ledger=virtual_ledger,
     market_data=market_data_provider,
     clock=market_clock,
     researcher=news_researcher,
+    gemini_rotator=gemini_rotator,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initial startup log
+    key_msg = f"{gemini_rotator.key_count} keys active (random rotation)" if gemini_rotator.key_count > 0 else "0 keys configured (heuristic engine active)"
     trading_agent.log_thought(
-        thought="MARkit Trading Engine initialized. Paper capital: ₹10,000.00 INR. Ready.",
+        thought=f"MARkit Trading Engine initialized. Paper capital: ₹10,000.00 INR. Gemini AI: {key_msg}.",
         action="SYSTEM_INIT",
     )
     yield
+
 
 
 app = FastAPI(title="MARkit Indian Stock Market Trading Agent", lifespan=lifespan)
@@ -90,6 +95,7 @@ def get_system_status():
         "daily_drawdown_pct": virtual_ledger.daily_drawdown_pct,
         "circuit_breaker_triggered": virtual_ledger.circuit_breaker_triggered,
         "open_positions_count": len(virtual_ledger.positions),
+        "gemini_keys_configured": gemini_rotator.key_count,
     }
 
 

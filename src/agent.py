@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from src.clock import MarketClock, MarketState
+from src.gemini_rotator import GeminiKeyRotator
 from src.ledger import OrderSide, OrderStatus, TradeResult, VirtualLedger
 from src.market_data import MarketDataProvider, QuoteSnapshot
 from src.research import NewsResearcher, SentimentRating
@@ -37,6 +38,7 @@ class AgentDecision:
     stop_loss: Optional[float] = None
     quantity: int = 0
     reasoning: str = ""
+    ai_thesis: Optional[str] = None
     technicals: Dict = field(default_factory=dict)
     sentiment: Dict = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -49,17 +51,21 @@ class TradingAgent:
         market_data: MarketDataProvider,
         clock: MarketClock,
         researcher: NewsResearcher,
+        gemini_rotator: Optional[GeminiKeyRotator] = None,
         gemini_api_key: Optional[str] = None,
     ):
         self.ledger = ledger
         self.market_data = market_data
         self.clock = clock
         self.researcher = researcher
-        self.gemini_api_key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
+        self.gemini_rotator = gemini_rotator or GeminiKeyRotator(
+            keys=[gemini_api_key] if gemini_api_key else None
+        )
 
         self.thought_logs: List[Dict] = []
         self.pre_market_plan: Dict = {}
         self.last_cycle_summary: Dict = {}
+
 
     def log_thought(self, thought: str, action: str = "ANALYSIS", details: Optional[Dict] = None) -> None:
         """Record structured agent thinking for real-time inspection."""
@@ -187,6 +193,12 @@ class TradingAgent:
             allocatable = min(max_capital_for_trade, available_cash * 0.95)
             quantity = int(allocatable // price)
 
+        ai_thesis = None
+        if action != ActionType.HOLD and self.gemini_rotator.key_count > 0:
+            ai_thesis = self.generate_ai_thesis(symbol, technicals, research, action)
+            if ai_thesis:
+                reasoning_parts.append(f"AI Thesis: {ai_thesis}")
+
         return AgentDecision(
             symbol=symbol,
             action=action,
@@ -195,9 +207,34 @@ class TradingAgent:
             stop_loss=stop_loss,
             quantity=quantity,
             reasoning=" ".join(reasoning_parts),
+            ai_thesis=ai_thesis,
             technicals=technicals,
             sentiment=research,
         )
+
+    def generate_ai_thesis(
+        self, symbol: str, technicals: Dict, sentiment: Dict, action: ActionType
+    ) -> Optional[str]:
+        """
+        Ask Gemini using randomly rotated API keys to synthesize a crisp trade thesis.
+        """
+        if self.gemini_rotator.key_count == 0:
+            return None
+
+        headlines_text = "\n".join([f"- {h['title']}" for h in sentiment.get("headlines", [])[:3]])
+        prompt = f"""You are a professional Indian Stock Market (NSE) Day Trader.
+Analyze this setup for {symbol}:
+- Proposed Action: {action.value}
+- Current Price: ₹{technicals.get('current_price')}
+- RSI (14): {technicals.get('rsi')}
+- Trend: {technicals.get('trend')} (EMA9: ₹{technicals.get('ema_fast')}, EMA21: ₹{technicals.get('ema_slow')})
+- News Sentiment: {sentiment.get('rating')} (Score: {sentiment.get('sentiment')})
+Recent Headlines:
+{headlines_text or "No immediate news"}
+
+Provide a crisp 1-2 sentence trade thesis and risk observation. Avoid preamble."""
+        return self.gemini_rotator.generate_text(prompt)
+
 
     def monitor_open_positions(self) -> List[TradeResult]:
         """

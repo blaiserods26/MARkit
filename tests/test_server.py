@@ -12,6 +12,7 @@ def test_api_status_endpoint():
     assert "ist_time" in data
     assert "can_trade" in data
     assert "equity" in data
+    assert "gemini_keys_configured" in data
 
 def test_api_portfolio_endpoint():
     response = client.get("/api/portfolio")

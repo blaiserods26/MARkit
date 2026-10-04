@@ -38,9 +38,26 @@ async function fetchStatus() {
       cbText.className = "metric-footer tag-positive";
       cbText.innerText = "Circuit Breaker Safe (<3.0%)";
     }
+
+    // Gemini key rotator status
+    const geminiBadge = document.getElementById("gemini-status-badge");
+    if (geminiBadge) {
+      if (data.gemini_keys_configured > 0) {
+        geminiBadge.style.color = "var(--accent-green)";
+        geminiBadge.style.background = "rgba(0, 229, 153, 0.12)";
+        geminiBadge.style.borderColor = "rgba(0, 229, 153, 0.3)";
+        geminiBadge.innerText = `Gemini AI: ${data.gemini_keys_configured} Key${data.gemini_keys_configured > 1 ? 's' : ''} (Random Rotation)`;
+      } else {
+        geminiBadge.style.color = "var(--text-dim)";
+        geminiBadge.style.background = "rgba(255, 255, 255, 0.05)";
+        geminiBadge.style.borderColor = "var(--border-color)";
+        geminiBadge.innerText = "Gemini AI: 0 Keys (Heuristic Engine)";
+      }
+    }
   } catch (e) {
     console.error("Error fetching status:", e);
   }
+
 }
 
 async function fetchPortfolio() {
