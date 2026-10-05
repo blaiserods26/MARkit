@@ -1,0 +1,2 @@
+Date -- Initial Amount -- Final Amount -- total number of trades -- Profit -- Loss
+2026-10-05 -- 10000.00 -- 9938.01 -- 32 -- 42.84 -- 102.23

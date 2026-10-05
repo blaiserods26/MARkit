@@ -102,6 +102,31 @@ class MarketClock:
         else:
             return False, "Off-hours research mode (16:00 - 09:00 IST). Only financial research permitted."
 
+    ENTRY_CUTOFF_TIME = time(14, 15)
+
+    def is_entry_allowed(self, dt: Optional[datetime] = None) -> Tuple[bool, str]:
+        """
+        Check whether opening a new position (BUY order) is allowed.
+        Blocks new entries after 14:15 IST to prevent auto-square-off chop.
+        """
+        if dt is None and self.simulation_mode:
+            return True, "Simulation Mode Active"
+
+        can_trade, reason = self.is_trading_allowed(dt)
+        if not can_trade:
+            return False, reason
+
+        current_dt = dt or self.now()
+        if current_dt.tzinfo is None:
+            current_dt = self.tz.localize(current_dt)
+        else:
+            current_dt = current_dt.astimezone(self.tz)
+
+        if current_dt.time() >= self.ENTRY_CUTOFF_TIME:
+            return False, f"Entry cutoff reached ({self.ENTRY_CUTOFF_TIME.strftime('%H:%M')} IST). New positions blocked before auto square-off."
+
+        return True, "Order entry permitted."
+
     def is_squareoff_window(self, dt: Optional[datetime] = None) -> bool:
         """Return True if within the 15:15 - 15:30 IST intraday square-off window."""
         return self.get_market_state(dt) == MarketState.AUTO_SQUAREOFF

@@ -241,6 +241,39 @@ def get_thought_logs(limit: int = 50):
     return {"thoughts": trading_agent.get_thought_logs(limit=limit)}
 
 
+@app.post("/api/reports/generate")
+def generate_report(date: Optional[str] = None):
+    report, md_path, json_path = trading_agent.reporter.generate_and_save(date)
+    return {
+        "status": "SUCCESS",
+        "report": asdict(report),
+        "md_path": md_path,
+        "json_path": json_path,
+        "summary_line": f"{report.date} -- {report.initial_amount:.2f} -- {report.final_amount:.2f} -- {report.total_trades} -- {report.profit:.2f} -- {report.loss:.2f}",
+    }
+
+
+@app.get("/api/reports/daily")
+def get_daily_report(date: Optional[str] = None):
+    report = trading_agent.reporter.compute_daily_metrics(date)
+    return asdict(report)
+
+
+@app.get("/api/reports/summary-document")
+def get_summary_document():
+    content = trading_agent.reporter.get_summary_document_content()
+    return {
+        "document_path": trading_agent.reporter.summary_doc_path,
+        "content": content,
+        "lines": [l.strip() for l in content.splitlines() if l.strip()],
+    }
+
+
+@app.get("/api/reports/list")
+def list_reports():
+    return {"reports": trading_agent.reporter.list_reports()}
+
+
 @app.get("/api/auto-trade/status")
 def get_auto_trade_status():
     return {

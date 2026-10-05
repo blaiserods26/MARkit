@@ -6,7 +6,7 @@ strict market clock state machine adherence, and live thought stream.
 """
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, time
 from enum import Enum
 import json
 import logging
@@ -18,6 +18,7 @@ from src.clock import MarketClock, MarketState
 from src.gemini_rotator import GeminiKeyRotator
 from src.ledger import OrderSide, OrderStatus, Position, TradeResult, VirtualLedger
 from src.market_data import MarketDataProvider, QuoteSnapshot
+from src.reporter import DailyReport, DailyReportGenerator
 from src.research import NewsResearcher, SentimentRating
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class TradingAgent:
         researcher: NewsResearcher,
         gemini_rotator: Optional[GeminiKeyRotator] = None,
         gemini_api_key: Optional[str] = None,
+        reporter: Optional[DailyReportGenerator] = None,
     ):
         self.ledger = ledger
         self.market_data = market_data
@@ -87,10 +89,19 @@ class TradingAgent:
         self.gemini_rotator = gemini_rotator or GeminiKeyRotator(
             keys=[gemini_api_key] if gemini_api_key else None
         )
+        self.reporter = reporter or DailyReportGenerator(ledger=self.ledger, clock=self.clock)
 
         self.thought_logs: List[Dict] = []
         self.pre_market_plan: Dict = {}
         self.last_cycle_summary: Dict = {}
+        self.last_report_date: Optional[str] = None
+        self.last_report: Optional[DailyReport] = None
+
+        # Execution guardrails to eliminate friction and churn
+        self.max_daily_trades: int = 5
+        self.cooldown_seconds: int = 1200  # 20 minutes cooldown per symbol after exit
+        self.min_dwell_seconds: int = 600  # 10 minutes minimum position holding time
+        self.symbol_cooldowns: Dict[str, datetime] = {}
 
 
     def log_thought(self, thought: str, action: str = "ANALYSIS", details: Optional[Dict] = None) -> None:
@@ -111,7 +122,7 @@ class TradingAgent:
 
     def compute_technicals(self, symbol: str) -> Dict:
         """
-        Calculate technical indicators: EMA 9, EMA 21, RSI 14, and Trend direction.
+        Calculate technical indicators: EMA 9, EMA 21, RSI 14, 15m Trend, and Volume Ratio.
         """
         df = self.market_data.get_intraday_history(symbol, interval="5m", period="5d")
         if df.empty or len(df) < 25:
@@ -123,7 +134,10 @@ class TradingAgent:
                 "ema_fast": p,
                 "ema_slow": p,
                 "trend": "NEUTRAL",
+                "trend_15m": "SIDEWAYS",
+                "vol_ratio": 1.0,
                 "volatility": 0.01,
+                "current_price": p,
             }
 
         close = df["Close"].copy()
@@ -139,7 +153,7 @@ class TradingAgent:
         rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
         rsi = max(0.0, min(100.0, round(rsi, 2)))
 
-        # Trend identification
+        # 5m Trend identification
         current_price = float(close.iloc[-1])
         if ema_fast > ema_slow and current_price >= ema_fast:
             trend = "BULLISH"
@@ -150,14 +164,70 @@ class TradingAgent:
 
         volatility = round(float(close.pct_change().std()), 4)
 
+        # Volume moving average ratio (20-period)
+        vol_ratio = 1.0
+        if "Volume" in df.columns and len(df["Volume"]) >= 5:
+            vol = df["Volume"]
+            vol_ma = vol.rolling(window=min(20, len(vol))).mean().iloc[-1]
+            last_vol = float(vol.iloc[-1])
+            if vol_ma > 0:
+                vol_ratio = round(last_vol / vol_ma, 2)
+
+        # 15-minute trend confirmation
+        trend_15m = "SIDEWAYS"
+        try:
+            df_15m = self.market_data.get_intraday_history(symbol, interval="15m", period="5d")
+            if not df_15m.empty and len(df_15m) >= 15:
+                c15 = df_15m["Close"]
+                ema9_15 = c15.ewm(span=9, adjust=False).mean().iloc[-1]
+                ema21_15 = c15.ewm(span=21, adjust=False).mean().iloc[-1]
+                last_p15 = float(c15.iloc[-1])
+                if ema9_15 > ema21_15 and last_p15 >= ema9_15:
+                    trend_15m = "BULLISH"
+                elif ema9_15 < ema21_15 and last_p15 <= ema9_15:
+                    trend_15m = "BEARISH"
+        except Exception:
+            pass
+
         return {
             "rsi": rsi,
             "ema_fast": round(float(ema_fast), 2),
             "ema_slow": round(float(ema_slow), 2),
             "trend": trend,
+            "trend_15m": trend_15m,
+            "vol_ratio": vol_ratio,
             "volatility": volatility,
             "current_price": round(current_price, 2),
         }
+
+    def get_market_regime(self) -> Dict:
+        """
+        Evaluate benchmark NIFTY 50 (^NSEI) 15m trend to protect against market-wide downturns.
+        """
+        try:
+            df = self.market_data.get_intraday_history("^NSEI", interval="15m", period="5d")
+            if df.empty or len(df) < 15:
+                return {"trend": "NEUTRAL", "symbol": "^NSEI", "rsi": 50.0}
+            c = df["Close"]
+            ema9 = c.ewm(span=9, adjust=False).mean().iloc[-1]
+            ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
+            p = float(c.iloc[-1])
+            if ema9 > ema21 and p >= ema9:
+                trend = "BULLISH"
+            elif ema9 < ema21 and p <= ema21:
+                trend = "BEARISH"
+            else:
+                trend = "SIDEWAYS"
+            return {
+                "trend": trend,
+                "symbol": "^NSEI",
+                "price": round(p, 2),
+                "ema_fast": round(float(ema9), 2),
+                "ema_slow": round(float(ema21), 2),
+            }
+        except Exception as e:
+            logger.debug(f"Unable to fetch NIFTY 50 regime: {e}")
+            return {"trend": "NEUTRAL", "symbol": "^NSEI"}
 
 
     def generate_ai_decision(
@@ -258,13 +328,16 @@ Respond with a JSON object in this exact format:
         symbol: str,
         is_held: Optional[bool] = None,
         held_position: Optional[Position] = None,
+        current_dt: Optional[datetime] = None,
     ) -> AgentDecision:
         """
         Evaluate a stock setup with full financial context:
         - Stocks NOT purchased before can ONLY be bought or held (SELL strictly prohibited).
         - Stocks PURCHASED BEFORE can be sold or held.
         - Buy sizing strictly limited to remaining allowable cash budget.
-        - Full financial metrics and constraints are dispatched to Gemini AI.
+        - Enforces minimum dwell time to prevent whipsaw indicator jitter.
+        - Enforces minimum 1:2 Risk:Reward ratio before BUY.
+        - Multi-timeframe trend & volume confirmation.
         """
         if is_held is None:
             is_held = symbol in self.ledger.positions
@@ -301,47 +374,90 @@ Respond with a JSON object in this exact format:
         target_price = None
         quantity = 0
 
+        now_dt = current_dt or self.clock.now()
+        dwell_seconds = 999999.0
+        if is_held and held_position and held_position.opened_at:
+            try:
+                op_dt = datetime.fromisoformat(held_position.opened_at)
+                if op_dt.tzinfo is None and now_dt.tzinfo is not None:
+                    op_dt = self.clock.tz.localize(op_dt)
+                elif op_dt.tzinfo is not None and now_dt.tzinfo is None:
+                    now_dt = self.clock.tz.localize(now_dt)
+                dwell_seconds = max(0.0, (now_dt - op_dt).total_seconds())
+            except Exception:
+                dwell_seconds = 999999.0
+
         if is_held and held_position:
             # STOCK WAS PURCHASED BEFORE: Evaluate for SELL or HOLD
             pnl_pct = held_position.unrealized_pnl_pct
-            if trend == "BEARISH" or rsi > 70 or sentiment_rating == SentimentRating.BEARISH or pnl_pct >= 2.5 or pnl_pct <= -1.5:
+            is_hard_stop = (pnl_pct <= -1.0) or (held_position.stop_loss is not None and price <= held_position.stop_loss)
+            is_target_hit = (pnl_pct >= 2.5) or (held_position.target is not None and price >= held_position.target)
+
+            # Prevent whipsaw / panic exits during minimum dwell time unless hard stop/target is hit
+            if dwell_seconds < self.min_dwell_seconds and not (is_hard_stop or is_target_hit):
+                action = ActionType.HOLD
+                confidence = 0.65
+                quantity = 0
+                reasoning_parts.append(
+                    f"Holding {symbol} ({held_position.quantity} shares): In minimum dwell window ({int(dwell_seconds)}s / {self.min_dwell_seconds}s). Protecting against whipsaw indicator jitter. P&L={pnl_pct:+.2f}%."
+                )
+            elif is_hard_stop or is_target_hit or trend == "BEARISH" or sentiment_rating == SentimentRating.BEARISH:
                 action = ActionType.SELL
-                confidence = 0.75 + (0.10 if trend == "BEARISH" else 0.0)
+                confidence = 0.80 + (0.10 if is_hard_stop else 0.0)
                 quantity = held_position.quantity
                 reasoning_parts.append(
-                    f"Intraday SELL signal on held stock {symbol} (purchased before): Trend={trend}, RSI={rsi}, Sentiment={sentiment_rating}, Unrealized P&L={pnl_pct}%."
+                    f"Intraday SELL signal on held stock {symbol}: HardStop={is_hard_stop}, TargetHit={is_target_hit}, Trend={trend}, RSI={rsi}, Sentiment={sentiment_rating}, P&L={pnl_pct:+.2f}%."
                 )
             else:
                 action = ActionType.HOLD
                 confidence = 0.60
                 quantity = 0
                 reasoning_parts.append(
-                    f"Holding {symbol} ({held_position.quantity} shares): Trend={trend}, RSI={rsi}, P&L={pnl_pct}%. Conditions stable."
+                    f"Holding {symbol} ({held_position.quantity} shares): Trend={trend}, RSI={rsi}, P&L={pnl_pct:+.2f}%. Position stable."
                 )
         else:
             # STOCK WAS NOT PURCHASED BEFORE: Evaluate for BUY or HOLD (CANNOT SELL!)
-            if trend == "BULLISH" and rsi < 65 and sentiment_rating != SentimentRating.BEARISH:
-                if max_buy_qty > 0 and available_cash >= price:
+            trend_15m = technicals.get("trend_15m", "SIDEWAYS")
+            vol_ratio = technicals.get("vol_ratio", 1.0)
+
+            # Multi-timeframe trend & volume confirmation
+            is_technical_bullish = (
+                trend == "BULLISH"
+                and trend_15m in ("BULLISH", "SIDEWAYS")
+                and (rsi < 65)
+                and (vol_ratio >= 0.75)
+                and sentiment_rating != SentimentRating.BEARISH
+            )
+
+            if is_technical_bullish:
+                # Minimum 1:2 Risk to Reward requirement
+                candidate_sl = round(price * 0.99, 2)       # 1.0% stop-loss
+                candidate_target = round(price * 1.025, 2)  # 2.5% target
+                risk = price - candidate_sl
+                reward = candidate_target - price
+                rr_ratio = reward / risk if risk > 0 else 0.0
+
+                if rr_ratio >= 2.0 and max_buy_qty > 0 and available_cash >= price:
                     action = ActionType.BUY
                     confidence = 0.75 + (0.15 if sentiment_rating == SentimentRating.BULLISH else 0.0)
                     quantity = max_buy_qty
-                    stop_loss = round(price * 0.985, 2)
-                    target_price = round(price * 1.03, 2)
+                    stop_loss = candidate_sl
+                    target_price = candidate_target
                     reasoning_parts.append(
-                        f"Bullish intraday setup for {symbol}: Trend={trend}, RSI={rsi}. "
-                        f"Purchase order sized to {quantity} shares (₹{quantity * price:.2f} <= ₹{max_order_val:.2f} remaining budget limit)."
+                        f"Bullish setup for {symbol}: 5m Trend={trend}, 15m Trend={trend_15m}, VolRatio={vol_ratio}, RSI={rsi}. "
+                        f"R:R={rr_ratio:.1f}:1. Sized to {quantity} shares (₹{quantity * price:.2f} <= ₹{max_order_val:.2f} budget limit)."
                     )
                 else:
                     action = ActionType.HOLD
                     confidence = 0.40
                     reasoning_parts.append(
-                        f"Bullish signal for {symbol}, but purchase order halted: remaining cash ₹{available_cash:.2f} insufficient for share price ₹{price:.2f} under budget limits."
+                        f"Bullish signal for {symbol}, but purchase order halted: R:R={rr_ratio:.1f}:1 or budget limit reached."
                     )
             else:
                 action = ActionType.HOLD
                 confidence = 0.50
                 reasoning_parts.append(
-                    f"Neutral/Bearish on unheld stock {symbol} (Trend={trend}, RSI={rsi}). Stock cannot be sold because it was not purchased before; holding."
+                    f"Neutral/Bearish on unheld stock {symbol} (5m={trend}, 15m={trend_15m}, RSI={rsi}, Vol={vol_ratio}). Holding."
                 )
 
         # AI Synthesis with Gemini: Only synthesize when an action setup (BUY or SELL) is triggered
@@ -422,30 +538,41 @@ Respond with a JSON object in this exact format:
         dec = self.generate_ai_decision(symbol, price, technicals, sentiment, is_held=(symbol in self.ledger.positions))
         return dec.get("thesis") if dec else None
 
-    def monitor_open_positions(self) -> List[TradeResult]:
+    def monitor_open_positions(self, current_dt: Optional[datetime] = None) -> List[TradeResult]:
         """
-        Check active positions against stop-loss and profit targets.
+        Check active positions against stop-loss, dynamic trailing stops, and profit targets.
         When stop/target triggers, proceeds are credited to cash.
         """
         results: List[TradeResult] = []
+        now_dt = current_dt or self.clock.now()
         for symbol, pos in list(self.ledger.positions.items()):
             quote = self.market_data.get_live_quote(symbol)
             if not quote:
                 continue
 
             current_price = quote.price
-            pos.current_price = current_price
+            pos.update_price(current_price)
 
-            # Stop loss hit
+            # Check dynamic trailing stop upgrade
+            new_sl = pos.check_trailing_stop(activation_gain_pct=0.015, trail_distance_pct=0.0075)
+            if new_sl:
+                self.log_thought(
+                    thought=f"TRAILING STOP RAISED: {symbol} trailing stop set to ₹{new_sl:.2f} (Locking in profit from peak ₹{pos.highest_price:.2f}).",
+                    action="TRAILING_STOP_UPDATE",
+                    details={"symbol": symbol, "trailing_stop": new_sl, "highest_price": pos.highest_price},
+                )
+
+            # Stop loss hit (fixed or trailing)
             if pos.stop_loss and current_price <= pos.stop_loss:
                 res = self.ledger.execute_order(
                     symbol=symbol,
                     side=OrderSide.SELL,
                     quantity=pos.quantity,
                     current_price=current_price,
-                    reason=f"Stop Loss Hit at ₹{current_price}",
+                    reason=f"Stop/Trailing Stop Loss Hit at ₹{current_price} (SL: ₹{pos.stop_loss})",
                 )
                 if res.status == OrderStatus.FILLED and res.trade:
+                    self.symbol_cooldowns[symbol] = now_dt
                     self.log_thought(
                         thought=f"STOP LOSS HIT: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
                         action="RISK_EXIT",
@@ -460,9 +587,10 @@ Respond with a JSON object in this exact format:
                     side=OrderSide.SELL,
                     quantity=pos.quantity,
                     current_price=current_price,
-                    reason=f"Profit Target Reached at ₹{current_price}",
+                    reason=f"Profit Target Reached at ₹{current_price} (TP: ₹{pos.target})",
                 )
                 if res.status == OrderStatus.FILLED and res.trade:
+                    self.symbol_cooldowns[symbol] = now_dt
                     self.log_thought(
                         thought=f"PROFIT TARGET REACHED: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
                         action="TARGET_EXIT",
@@ -471,6 +599,49 @@ Respond with a JSON object in this exact format:
                     results.append(res)
 
         return results
+
+    def generate_ai_reflection(self, report: DailyReport) -> str:
+        """Post-market reflection prompt analyzing friction, win rate, and strategic tuning."""
+        if self.gemini_rotator.key_count == 0:
+            return "AI key not configured; quantitative summary recorded."
+        prompt = f"""You are the MARkit Indian Stock Trading Risk Officer.
+Review the trading session performance for {report.date}:
+- Initial Capital: ₹{report.initial_amount:.2f}
+- Final Capital: ₹{report.final_amount:.2f}
+- Net Realized P&L: ₹{report.net_pnl:+.2f} ({report.net_return_pct:+.2f}%)
+- Total Trades: {report.total_trades} (Profit: ₹{report.profit:.2f}, Loss: ₹{report.loss:.2f})
+- Win Rate: {report.win_rate_pct:.1f}% ({report.winning_trades} Win / {report.losing_trades} Loss)
+- Total Charges: ₹{report.total_charges:.2f}, Slippage: ₹{report.total_slippage:.2f}
+
+Provide a concise post-market analysis (3-4 bullet points):
+1. Execution quality and friction impact.
+2. What went well or poorly in strategy timing / selection.
+3. 2 concrete risk management recommendations for tomorrow's market session."""
+        try:
+            res = self.gemini_rotator.generate_text(prompt)
+            reflection = res.strip() if res else "AI post-market reflection complete."
+            lessons_file = "reports/ai_lessons.json"
+            os.makedirs("reports", exist_ok=True)
+            existing_lessons = {}
+            if os.path.exists(lessons_file):
+                try:
+                    with open(lessons_file, "r", encoding="utf-8") as f:
+                        existing_lessons = json.load(f)
+                except Exception:
+                    existing_lessons = {}
+            existing_lessons[report.date] = {
+                "date": report.date,
+                "net_pnl": report.net_pnl,
+                "win_rate": report.win_rate_pct,
+                "total_trades": report.total_trades,
+                "reflection": reflection,
+                "timestamp": datetime.now().isoformat(),
+            }
+            with open(lessons_file, "w", encoding="utf-8") as f:
+                json.dump(existing_lessons, f, indent=2)
+            return reflection
+        except Exception as e:
+            return f"AI reflection could not be generated: {e}"
 
     def execute_trade_cycle(self, mock_dt: Optional[datetime] = None) -> Dict:
         """
@@ -490,6 +661,7 @@ Respond with a JSON object in this exact format:
             "status": "IDLE",
             "trades_executed": [],
             "research_brief": {},
+            "daily_report": None,
         }
 
         # 1. If within Auto Square-Off window (15:15 - 15:30 IST)
@@ -507,6 +679,7 @@ Respond with a JSON object in this exact format:
             cycle_result["status"] = "AUTO_SQUAREOFF"
             for r in squareoff_res:
                 if r.trade:
+                    self.symbol_cooldowns[r.trade.symbol] = current_dt
                     self.log_thought(
                         thought=f"SQUARE-OFF FILLED: Sold {r.trade.quantity} {r.trade.symbol} @ ₹{r.filled_price}. Cash Credited: ₹{r.trade.net_amount:.2f}. PnL: ₹{r.trade.pnl:+.2f}. Final Cash Balance: ₹{self.ledger.cash_balance:.2f}.",
                         action="AUTO_SQUAREOFF_EXIT",
@@ -515,8 +688,42 @@ Respond with a JSON object in this exact format:
                     cycle_result["trades_executed"].append(asdict(r.trade))
             return cycle_result
 
-        # 2. If Off-Hours (Night or Weekend) or Pre-Market
+        # 2. Check for End-of-Day / Post-Market Report Generation
+        today_str = current_dt.strftime("%Y-%m-%d")
         if not can_trade:
+            # If after market close (post-market review or >= 15:30 on weekdays), ensure daily report is generated
+            is_post_market = (
+                market_state == MarketState.POST_MARKET_REVIEW
+                or (current_dt.weekday() < 5 and current_dt.time() >= time(15, 30))
+            )
+            if is_post_market:
+                current_day_trades = len(self.reporter.get_trades_for_date(today_str))
+                if self.last_report_date != today_str or (
+                    self.last_report and self.last_report.total_trades != current_day_trades
+                ):
+                    report, md_path, json_path = self.reporter.generate_and_save(today_str)
+                    self.last_report_date = today_str
+                    self.last_report = report
+                    reflection = self.generate_ai_reflection(report)
+                    self.log_thought(
+                        thought=(
+                            f"TRADING DAY CONCLUDED: Post-market daily report generated for {today_str}. "
+                            f"Initial: ₹{report.initial_amount:.2f}, Final: ₹{report.final_amount:.2f}, "
+                            f"Trades: {report.total_trades}, Profit: ₹{report.profit:.2f}, Loss: ₹{report.loss:.2f}, "
+                            f"Net P&L: ₹{report.net_pnl:+.2f}. AI Reflection: {reflection[:100]}..."
+                        ),
+                        action="DAILY_REPORT_GENERATED",
+                        details={
+                            "date": report.date,
+                            "report_md": md_path,
+                            "report_json": json_path,
+                            "total_trades": report.total_trades,
+                            "net_pnl": report.net_pnl,
+                            "ai_reflection": reflection,
+                        },
+                    )
+                    cycle_result["daily_report"] = asdict(report)
+
             self.log_thought(
                 thought=f"Market is closed ({reason}). Execution locked. Running financial research mode.",
                 action="OFF_HOURS_RESEARCH",
@@ -554,15 +761,15 @@ Respond with a JSON object in this exact format:
             },
         )
 
-        # Step 3A: Monitor stop-loss and profit targets on existing positions
-        monitor_trades = self.monitor_open_positions()
+        # Step 3A: Monitor stop-loss, dynamic trailing stops, and profit targets
+        monitor_trades = self.monitor_open_positions(current_dt=current_dt)
         for tr in monitor_trades:
             if tr.trade:
                 cycle_result["trades_executed"].append(asdict(tr.trade))
 
         # Step 3B: Evaluate currently held positions (purchased before) for AI / technical SELL signals
         for sym, pos in list(self.ledger.positions.items()):
-            decision = self.evaluate_opportunity(sym, is_held=True, held_position=pos)
+            decision = self.evaluate_opportunity(sym, is_held=True, held_position=pos, current_dt=current_dt)
             self.log_thought(
                 thought=f"Evaluated held position {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. {decision.reasoning}",
                 action="POSITION_EVALUATION",
@@ -580,6 +787,7 @@ Respond with a JSON object in this exact format:
                     reason=f"AI/Technical Intraday Exit: {decision.reasoning}",
                 )
                 if res.status == OrderStatus.FILLED and res.trade:
+                    self.symbol_cooldowns[sym] = current_dt
                     self.log_thought(
                         thought=f"CASH CREDITED: Credited ₹{res.trade.net_amount:.2f} from selling {sell_qty} {sym} @ ₹{res.filled_price}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Balance: ₹{self.ledger.cash_balance:.2f}.",
                         action="EXECUTION_SELL",
@@ -596,46 +804,113 @@ Respond with a JSON object in this exact format:
             cycle_result["status"] = "CIRCUIT_BREAKER_HALT"
             return cycle_result
 
-        # Step 3D: Scan liquid watchlist for BUY opportunities if capital available and < 3 open positions
-        if len(self.ledger.positions) < 3 and self.ledger.cash_balance >= 300.0:
-            symbols = self.market_data.get_nifty50_symbols()[:6]
-            for sym in symbols:
-                if sym in self.ledger.positions:
-                    continue  # Already purchased before; skip to avoid duplicate entries
+        # Step 3D: Timing gates and daily trade limit check before scanning BUY opportunities
+        can_enter, entry_reason = self.clock.is_entry_allowed(current_dt)
+        today_buys = [
+            t for t in self.ledger.trades
+            if t.timestamp.startswith(today_str) and t.side == OrderSide.BUY
+        ]
 
-                decision = self.evaluate_opportunity(sym, is_held=False, held_position=None)
+        if not can_enter:
+            self.log_thought(
+                thought=f"ENTRY CUTOFF ACTIVE: {entry_reason}. Scanning for new BUY positions halted.",
+                action="ENTRY_CUTOFF_HALT",
+            )
+        elif len(today_buys) >= self.max_daily_trades:
+            self.log_thought(
+                thought=f"DAILY TRADE LIMIT REACHED: {len(today_buys)}/{self.max_daily_trades} BUY orders executed today. Halting new entries to prevent friction bleed.",
+                action="DAILY_LIMIT_HALT",
+            )
+        elif len(self.ledger.positions) < 3 and self.ledger.cash_balance >= 300.0:
+            regime = self.get_market_regime()
+            if regime.get("trend") == "BEARISH":
                 self.log_thought(
-                    thought=f"Evaluated {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. Sizing: {decision.quantity} shares. {decision.reasoning}",
-                    action="EVALUATION",
-                    details={
-                        "symbol": sym,
-                        "action": decision.action.value,
-                        "confidence": decision.confidence,
-                        "quantity": decision.quantity,
-                    },
+                    thought="MARKET REGIME BEARISH: Benchmark NIFTY 50 (^NSEI) is trending down (EMA9 < EMA21). Blocking new long entries.",
+                    action="REGIME_FILTER",
+                    details=regime,
                 )
+            else:
+                symbols = self.market_data.get_nifty50_symbols()[:6]
+                for sym in symbols:
+                    if sym in self.ledger.positions:
+                        continue  # Already purchased before; skip to avoid duplicate entries
 
-                if decision.action == ActionType.BUY and decision.confidence >= 0.70 and decision.quantity > 0:
-                    quote = self.market_data.get_live_quote(sym)
-                    if quote:
-                        res = self.ledger.execute_order(
-                            symbol=sym,
-                            side=OrderSide.BUY,
-                            quantity=decision.quantity,
-                            current_price=quote.price,
-                            stop_loss=decision.stop_loss,
-                            target=decision.target_price,
-                            reason=f"AI Trade Setup: {decision.reasoning}",
-                        )
-                        if res.status == OrderStatus.FILLED and res.trade:
+                    # Check symbol cooldown (20 minutes after last exit)
+                    if sym in self.symbol_cooldowns:
+                        last_exit = self.symbol_cooldowns[sym]
+                        cur_compare = current_dt
+                        if last_exit.tzinfo is None and cur_compare.tzinfo is not None:
+                            last_exit = self.clock.tz.localize(last_exit)
+                        elif last_exit.tzinfo is not None and cur_compare.tzinfo is None:
+                            cur_compare = self.clock.tz.localize(cur_compare)
+                        elapsed_cd = (cur_compare - last_exit).total_seconds()
+                        if elapsed_cd < self.cooldown_seconds:
                             self.log_thought(
-                                thought=f"CASH DEBITED: Debited ₹{res.trade.net_amount:.2f} for purchasing {decision.quantity} {sym} @ ₹{res.filled_price}. Remaining Cash Balance: ₹{self.ledger.cash_balance:.2f} (Purchase order strictly limited to budget ceiling). SL: ₹{decision.stop_loss}, TP: ₹{decision.target_price}.",
-                                action="EXECUTION_BUY",
-                                details=asdict(res.trade),
+                                thought=f"SYMBOL COOLDOWN ACTIVE: {sym} was exited {int(elapsed_cd)}s ago (< {self.cooldown_seconds}s). Skipping to prevent churn.",
+                                action="COOLDOWN_SKIP",
+                                details={"symbol": sym, "elapsed": elapsed_cd, "cooldown": self.cooldown_seconds},
                             )
-                            cycle_result["trades_executed"].append(asdict(res.trade))
-                            break  # Execute one high-conviction order per cycle
+                            continue
+
+                    decision = self.evaluate_opportunity(sym, is_held=False, held_position=None, current_dt=current_dt)
+                    self.log_thought(
+                        thought=f"Evaluated {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. Sizing: {decision.quantity} shares. {decision.reasoning}",
+                        action="EVALUATION",
+                        details={
+                            "symbol": sym,
+                            "action": decision.action.value,
+                            "confidence": decision.confidence,
+                            "quantity": decision.quantity,
+                        },
+                    )
+
+                    if decision.action == ActionType.BUY and decision.confidence >= 0.70 and decision.quantity > 0:
+                        quote = self.market_data.get_live_quote(sym)
+                        if quote:
+                            res = self.ledger.execute_order(
+                                symbol=sym,
+                                side=OrderSide.BUY,
+                                quantity=decision.quantity,
+                                current_price=quote.price,
+                                stop_loss=decision.stop_loss,
+                                target=decision.target_price,
+                                reason=f"AI Trade Setup: {decision.reasoning}",
+                            )
+                            if res.status == OrderStatus.FILLED and res.trade:
+                                self.log_thought(
+                                    thought=f"CASH DEBITED: Debited ₹{res.trade.net_amount:.2f} for purchasing {decision.quantity} {sym} @ ₹{res.filled_price}. Remaining Cash Balance: ₹{self.ledger.cash_balance:.2f} (Purchase order strictly limited to budget ceiling). SL: ₹{decision.stop_loss}, TP: ₹{decision.target_price}.",
+                                    action="EXECUTION_BUY",
+                                    details=asdict(res.trade),
+                                )
+                                cycle_result["trades_executed"].append(asdict(res.trade))
+                                break  # Execute one high-conviction order per cycle
 
         cycle_result["status"] = "ACTIVE_MARKET_CYCLE_COMPLETE"
         self.last_cycle_summary = cycle_result
         return cycle_result
+
+    def generate_daily_report(self, date_str: Optional[str] = None) -> DailyReport:
+        """Manually trigger daily report generation and common master document update."""
+        report, md_path, json_path = self.reporter.generate_and_save(date_str)
+        self.last_report_date = report.date
+        self.last_report = report
+        reflection = self.generate_ai_reflection(report)
+        self.log_thought(
+            thought=(
+                f"DAILY REPORT GENERATED on demand for {report.date}. "
+                f"Initial: ₹{report.initial_amount:.2f}, Final: ₹{report.final_amount:.2f}, "
+                f"Trades: {report.total_trades}, Profit: ₹{report.profit:.2f}, Loss: ₹{report.loss:.2f}, "
+                f"Net P&L: ₹{report.net_pnl:+.2f}. Master record updated."
+            ),
+            action="MANUAL_REPORT_GENERATED",
+            details={
+                "date": report.date,
+                "md_path": md_path,
+                "json_path": json_path,
+                "total_trades": report.total_trades,
+                "net_pnl": report.net_pnl,
+                "ai_reflection": reflection,
+            },
+        )
+        return report
+

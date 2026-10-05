@@ -3,11 +3,13 @@ Market Data Provider for Indian Stock Exchanges (NSE / BSE).
 Uses zero-credential yfinance with caching, fallback mechanisms, and standardized IST timestamps.
 """
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Optional
 import pandas as pd
+import requests
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,13 @@ class MarketDataProvider:
     def __init__(self, cache_ttl_seconds: int = 10):
         self._cache_ttl = timedelta(seconds=cache_ttl_seconds)
         self._quote_cache: Dict[str, tuple[datetime, QuoteSnapshot]] = {}
+        self._last_known_quotes: Dict[str, QuoteSnapshot] = {}
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
     def get_nifty50_symbols(self) -> List[str]:
         """Return the curated list of highly liquid NIFTY 50 tickers."""
@@ -70,38 +79,63 @@ class MarketDataProvider:
             if now - cache_time < self._cache_ttl:
                 return cached_quote
 
+        ticker = yf.Ticker(symbol, session=self._session)
+        price = None
+        day_high = None
+        day_low = None
+        prev_close = None
+        volume = 0
+
+        # Tier 1: Try yfinance fast_info safely (guard against KeyError / scraper crashes)
         try:
-            ticker = yf.Ticker(symbol)
             fast = ticker.fast_info
+            p = getattr(fast, "last_price", None)
+            if p is not None and not pd.isna(p) and float(p) > 0:
+                price = float(p)
+                day_high = getattr(fast, "day_high", None)
+                day_low = getattr(fast, "day_low", None)
+                prev_close = getattr(fast, "previous_close", None)
+                volume = getattr(fast, "last_volume", 0) or 0
+        except Exception as fe:
+            logger.debug(f"fast_info lookup failed for {symbol}: {fe}")
 
-            price = getattr(fast, "last_price", None)
-            day_high = getattr(fast, "day_high", None)
-            day_low = getattr(fast, "day_low", None)
-            prev_close = getattr(fast, "previous_close", None)
-            volume = getattr(fast, "last_volume", 0) or 0
-
-            # Fallback to history if fast_info missing last_price
-            if price is None or price <= 0:
-                hist = ticker.history(period="5d", interval="5m")
+        # Tier 2: Fallback to recent intraday history and metadata if fast_info missing or failed
+        if price is None or price <= 0 or math.isnan(price):
+            try:
+                hist = ticker.history(period="1d", interval="1m")
+                if hist.empty:
+                    hist = ticker.history(period="5d", interval="5m")
                 if not hist.empty:
+                    md = {}
+                    try:
+                        md = ticker.get_history_metadata() or {}
+                    except Exception:
+                        pass
                     last_row = hist.iloc[-1]
-                    price = float(last_row["Close"])
-                    day_high = float(hist["High"].iloc[-1]) if day_high is None else day_high
-                    day_low = float(hist["Low"].iloc[-1]) if day_low is None else day_low
-                    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else price
-                    volume = int(last_row.get("Volume", 0))
+                    price = float(md.get("regularMarketPrice") or last_row["Close"])
+                    day_high = float(md.get("regularMarketDayHigh") or (hist["High"].max() if "High" in hist else price))
+                    day_low = float(md.get("regularMarketDayLow") or (hist["Low"].min() if "Low" in hist else price))
+                    prev_close = float(md.get("chartPreviousClose") or (hist["Close"].iloc[-2] if len(hist) > 1 else price))
+                    volume = int(md.get("regularMarketVolume") or last_row.get("Volume", 0))
+            except Exception as he:
+                logger.warning(f"History quote fallback failed for {symbol}: {he}")
 
-            if price is None or price <= 0:
-                logger.error(f"Could not fetch valid price for {symbol}")
-                return None
+        # Tier 3: Return last known quote if available before giving up
+        if price is None or price <= 0 or math.isnan(price):
+            if symbol in self._last_known_quotes:
+                logger.warning(f"Using last known quote for {symbol} due to upstream data provider failure")
+                return self._last_known_quotes[symbol]
+            logger.error(f"Could not fetch valid price for {symbol}")
+            return None
 
+        try:
             price = round(float(price), 2)
-            day_high = round(float(day_high if day_high else price), 2)
-            day_low = round(float(day_low if day_low else price), 2)
+            day_high = round(float(day_high if day_high and not pd.isna(day_high) else price), 2)
+            day_low = round(float(day_low if day_low and not pd.isna(day_low) else price), 2)
 
             change_pct = 0.0
-            if prev_close and prev_close > 0:
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+            if prev_close and not pd.isna(prev_close) and float(prev_close) > 0:
+                change_pct = round(((price - float(prev_close)) / float(prev_close)) * 100, 2)
 
             snapshot = QuoteSnapshot(
                 symbol=symbol,
@@ -109,16 +143,19 @@ class MarketDataProvider:
                 day_high=day_high,
                 day_low=day_low,
                 change_pct=change_pct,
-                volume=int(volume),
+                volume=int(volume or 0),
                 timestamp=now,
                 currency="INR",
             )
 
             self._quote_cache[symbol] = (now, snapshot)
+            self._last_known_quotes[symbol] = snapshot
             return snapshot
 
         except Exception as e:
-            logger.exception(f"Error fetching quote for {symbol}: {e}")
+            logger.warning(f"Error computing quote snapshot for {symbol}: {e}")
+            if symbol in self._last_known_quotes:
+                return self._last_known_quotes[symbol]
             return None
 
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, QuoteSnapshot]:
@@ -139,7 +176,7 @@ class MarketDataProvider:
         Retrieve intraday OHLCV bars for technical indicator computation.
         """
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=self._session)
             df = ticker.history(period=period, interval=interval)
             if df.empty:
                 # Fallback to longer period if weekend / holiday

@@ -51,3 +51,16 @@ def test_night_research_hours():
     assert state == MarketState.OFF_HOURS_RESEARCH
     can_trade, _ = clock.is_trading_allowed(mock_dt)
     assert can_trade is False
+
+def test_entry_cutoff_hours():
+    clock = MarketClock()
+    # Wednesday 14:10 IST - before cutoff, entry allowed
+    mock_dt_before = datetime(2026, 10, 7, 14, 10, 0, tzinfo=IST)
+    allowed, reason = clock.is_entry_allowed(mock_dt_before)
+    assert allowed is True
+
+    # Wednesday 14:20 IST - after cutoff, entry blocked
+    mock_dt_after = datetime(2026, 10, 7, 14, 20, 0, tzinfo=IST)
+    allowed, reason = clock.is_entry_allowed(mock_dt_after)
+    assert allowed is False
+    assert "cutoff" in reason.lower()

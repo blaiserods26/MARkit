@@ -21,6 +21,7 @@ An autonomous Python trading & research agent with a paper-trading simulation le
 - [Financial News Research & Sentiment Analysis Tool](issues/04-financial-news-research-and-sentiment-tool.md): Built NewsResearcher combining Google News RSS and Economic Times feeds with financial lexicon sentiment scoring and pre-market briefings.
 - [Trading Agent Decision Engine & Execution Loop](issues/05-trading-agent-decision-engine.md): Implemented TradingAgent orchestrating technical indicators (RSI, EMA), news sentiment, position monitoring, and market lifecycle transitions.
 - [Real-Time Dark-Mode Trading Desk Dashboard](issues/06-fastapi-realtime-trading-dashboard.md): Built modern glassmorphic trading desk dashboard (FastAPI + Vanilla CSS/JS) with live IST clock, thought stream, metrics, watchlist, and order simulation.
+- [Daily Trading Report & Performance Summary Generator](issues/07-daily-trading-report-generation.md): Implemented DailyReportGenerator in `src/reporter.py` generating end-of-day trade execution reports with all parameters, maintaining persistent `reports/daily_summary.txt` (`Date -- Initial Amount -- Final Amount -- total number of trades -- Profit -- Loss`), agent lifecycle triggers, REST endpoints, and modal dashboard UI.
 
 ## Not yet specified
 

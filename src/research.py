@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import logging
+import time
 from typing import Dict, List, Optional
 import urllib.parse
 import urllib.request
@@ -80,7 +81,7 @@ class SentimentScore:
 
 
 class NewsResearcher:
-    def __init__(self, request_timeout: int = 8):
+    def __init__(self, request_timeout: int = 12):
         self.request_timeout = request_timeout
 
     def _get_company_name(self, symbol: str) -> str:
@@ -123,7 +124,7 @@ class NewsResearcher:
 
     def fetch_symbol_news(self, symbol: str, limit: int = 5) -> List[NewsArticle]:
         """
-        Fetch the latest live news headlines for an Indian stock symbol.
+        Fetch the latest live news headlines for an Indian stock symbol with retry resilience.
         """
         company_name = self._get_company_name(symbol)
         query = f"{company_name} share stock NSE"
@@ -131,49 +132,71 @@ class NewsResearcher:
         url = f"https://news.google.com/rss/search?q={encoded}&hl=en-IN&gl=IN&ceid=IN:en"
 
         articles: List[NewsArticle] = []
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=self.request_timeout) as res:
-                root = ET.fromstring(res.read())
-                items = root.findall(".//item")
-                for item in items[:limit]:
-                    title_elem = item.find("title")
-                    link_elem = item.find("link")
-                    pub_elem = item.find("pubDate")
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=self.request_timeout) as res:
+                    root = ET.fromstring(res.read())
+                    items = root.findall(".//item")
+                    for item in items[:limit]:
+                        title_elem = item.find("title")
+                        link_elem = item.find("link")
+                        pub_elem = item.find("pubDate")
 
-                    title = title_elem.text if title_elem is not None and title_elem.text else "No title"
-                    link = link_elem.text if link_elem is not None and link_elem.text else ""
-                    pub = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
+                        title = title_elem.text if title_elem is not None and title_elem.text else "No title"
+                        link = link_elem.text if link_elem is not None and link_elem.text else ""
+                        pub = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
 
-                    articles.append(NewsArticle(title=title, url=link, published_at=pub))
-        except Exception as e:
-            logger.warning(f"Error fetching news for {symbol}: {e}")
+                        articles.append(NewsArticle(title=title, url=link, published_at=pub))
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                logger.warning(f"Error fetching news for {symbol}: {e}")
 
         return articles
 
     def fetch_macro_news(self, limit: int = 10) -> List[NewsArticle]:
         """
-        Fetch overall Indian market / NIFTY macro news headlines from Economic Times RSS.
+        Fetch overall Indian market / NIFTY macro news headlines from Economic Times RSS with retry resilience.
         """
         url = "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"
         articles: List[NewsArticle] = []
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=self.request_timeout) as res:
-                root = ET.fromstring(res.read())
-                items = root.findall(".//item")
-                for item in items[:limit]:
-                    title_elem = item.find("title")
-                    link_elem = item.find("link")
-                    pub_elem = item.find("pubDate")
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=self.request_timeout) as res:
+                    root = ET.fromstring(res.read())
+                    items = root.findall(".//item")
+                    for item in items[:limit]:
+                        title_elem = item.find("title")
+                        link_elem = item.find("link")
+                        pub_elem = item.find("pubDate")
 
-                    title = title_elem.text if title_elem is not None and title_elem.text else "No title"
-                    link = link_elem.text if link_elem is not None and link_elem.text else ""
-                    pub = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
+                        title = title_elem.text if title_elem is not None and title_elem.text else "No title"
+                        link = link_elem.text if link_elem is not None and link_elem.text else ""
+                        pub = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
 
-                    articles.append(NewsArticle(title=title, url=link, published_at=pub, source="Economic Times"))
-        except Exception as e:
-            logger.warning(f"Error fetching macro news: {e}")
+                        articles.append(NewsArticle(title=title, url=link, published_at=pub, source="Economic Times"))
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                logger.warning(f"Error fetching macro news: {e}")
 
         return articles
 

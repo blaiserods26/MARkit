@@ -352,6 +352,116 @@ async function submitOrder() {
   }
 }
 
+// Daily Report Modal Controller
+function openReportModal() {
+  const modal = document.getElementById("report-modal");
+  if (modal) {
+    modal.classList.add("active");
+    loadDailyReportData();
+  }
+}
+
+function closeReportModal() {
+  const modal = document.getElementById("report-modal");
+  if (modal) {
+    modal.classList.remove("active");
+  }
+}
+
+async function loadDailyReportData() {
+  try {
+    // 1. Fetch current daily report metrics & trades
+    const res = await fetch("/api/reports/daily");
+    if (res.ok) {
+      const data = await res.json();
+      document.getElementById("report-date-badge").innerText = data.date || "Today";
+      document.getElementById("rep-initial-amount").innerText = formatINR(data.initial_amount);
+      document.getElementById("rep-final-amount").innerText = formatINR(data.final_amount);
+      document.getElementById("rep-total-trades").innerText = data.total_trades;
+      document.getElementById("rep-trades-breakdown").innerText = `${data.buy_trades} BUY / ${data.sell_trades} SELL (${data.win_rate_pct}% Win)`;
+      document.getElementById("rep-gross-profit").innerText = formatINR(data.profit);
+      document.getElementById("rep-gross-loss").innerText = formatINR(data.loss);
+
+      const netPnlEl = document.getElementById("rep-net-pnl");
+      const sign = data.net_pnl > 0 ? "+" : "";
+      netPnlEl.innerText = `${sign}${formatINR(data.net_pnl)}`;
+      netPnlEl.className = "report-kpi-value " + (data.net_pnl > 0 ? "tag-positive" : data.net_pnl < 0 ? "tag-negative" : "tag-neutral");
+
+      const retSign = data.net_return_pct > 0 ? "+" : "";
+      document.getElementById("rep-net-return").innerText = `${retSign}${data.net_return_pct.toFixed(2)}% Return`;
+
+      const slipBadge = document.getElementById("rep-charges-slip-badge");
+      if (slipBadge) {
+        slipBadge.innerText = `Charges: ${formatINR(data.total_charges)} | Slippage: ${formatINR(data.total_slippage)}`;
+      }
+
+      // Render daily trades table
+      const tbody = document.getElementById("rep-trades-table-body");
+      if (tbody) {
+        if (!data.trades || data.trades.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; color: var(--text-dim); padding: 20px;">No trades recorded for this date.</td></tr>';
+        } else {
+          tbody.innerHTML = data.trades.map(t => {
+            const timeStr = t.timestamp.includes("T") ? t.timestamp.split("T")[1].substring(0, 8) : t.timestamp;
+            const pnlStr = t.side === "SELL" ? (t.pnl >= 0 ? `+${formatINR(t.pnl)}` : `-${formatINR(Math.abs(t.pnl))}`) : "—";
+            const pnlClass = t.side === "SELL" ? (t.pnl >= 0 ? "tag-positive" : "tag-negative") : "";
+            const sideClass = t.side === "BUY" ? "tag-buy" : "tag-sell";
+
+            return `<tr>
+              <td><code>${t.trade_id}</code></td>
+              <td style="color: var(--text-dim);">${timeStr}</td>
+              <td style="font-weight: 600; color: var(--text-bright);">${t.symbol}</td>
+              <td><span class="${sideClass}">${t.side}</span></td>
+              <td>${t.quantity}</td>
+              <td>${formatINR(t.requested_price)}</td>
+              <td>${formatINR(t.filled_price)}</td>
+              <td>${formatINR(t.slippage)}</td>
+              <td>${formatINR(t.charges)}</td>
+              <td>${formatINR(t.net_amount)}</td>
+              <td class="${pnlClass}">${pnlStr}</td>
+              <td style="font-size: 11px; color: var(--text-dim); max-width: 200px; white-space: normal;">${t.reason || "Executed"}</td>
+            </tr>`;
+          }).join("");
+        }
+      }
+    }
+
+    // 2. Fetch master summary document content
+    const docRes = await fetch("/api/reports/summary-document");
+    if (docRes.ok) {
+      const docData = await docRes.json();
+      const preEl = document.getElementById("rep-master-doc-content");
+      if (preEl) {
+        preEl.innerText = docData.content || "Empty master document.";
+      }
+    }
+  } catch (e) {
+    console.error("Error loading daily report data:", e);
+  }
+}
+
+async function triggerReportGeneration() {
+  const btn = event?.currentTarget;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerText = "Generating...";
+  }
+  try {
+    const res = await fetch("/api/reports/generate", { method: "POST" });
+    if (res.ok) {
+      await loadDailyReportData();
+      await fetchThoughts();
+    }
+  } catch (e) {
+    alert("Error generating report: " + e.message);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg> Generate / Refresh Report`;
+    }
+  }
+}
+
 // Mobile View Tab Switcher
 let activeMobileTab = "all";
 

@@ -34,7 +34,12 @@ class Position:
     current_price: float
     stop_loss: Optional[float] = None
     target: Optional[float] = None
+    highest_price: float = 0.0
     opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def __post_init__(self):
+        if self.highest_price <= 0:
+            self.highest_price = max(self.current_price, self.average_entry_price)
 
     @property
     def market_value(self) -> float:
@@ -49,6 +54,30 @@ class Position:
         if self.average_entry_price <= 0:
             return 0.0
         return round(((self.current_price - self.average_entry_price) / self.average_entry_price) * 100, 2)
+
+    def update_price(self, new_price: float) -> None:
+        self.current_price = new_price
+        if self.highest_price <= 0:
+            self.highest_price = max(new_price, self.average_entry_price)
+        else:
+            self.highest_price = max(self.highest_price, new_price)
+
+    def check_trailing_stop(self, activation_gain_pct: float = 0.015, trail_distance_pct: float = 0.0075) -> Optional[float]:
+        """
+        Dynamic trailing stop:
+        Activates when unrealized gain reaches +1.5% from average entry.
+        Trails the highest watermark price by 0.75%.
+        Returns new stop_loss if updated, else None.
+        """
+        if self.highest_price <= 0 or self.average_entry_price <= 0:
+            return None
+        max_gain_pct = (self.highest_price - self.average_entry_price) / self.average_entry_price
+        if max_gain_pct >= activation_gain_pct:
+            new_sl = round(self.highest_price * (1.0 - trail_distance_pct), 2)
+            if self.stop_loss is None or new_sl > self.stop_loss:
+                self.stop_loss = new_sl
+                return new_sl
+        return None
 
 
 @dataclass
@@ -338,6 +367,7 @@ class VirtualLedger:
                     "stop_loss": p.stop_loss,
                     "target": p.target,
                     "opened_at": p.opened_at,
+                    "highest_price": p.highest_price,
                 }
                 for sym, p in self.positions.items()
             },
@@ -383,6 +413,7 @@ class VirtualLedger:
                     current_price=p["current_price"],
                     stop_loss=p.get("stop_loss"),
                     target=p.get("target"),
+                    highest_price=p.get("highest_price", p["current_price"]),
                     opened_at=p.get("opened_at", datetime.now().isoformat()),
                 )
 

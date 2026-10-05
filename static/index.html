@@ -41,6 +41,11 @@
           Market: Live NSE
         </button>
 
+        <button id="btn-open-report" class="btn btn-secondary" onclick="openReportModal()" title="View Daily Trading Report & Master Document">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+          Daily Report
+        </button>
+
         <button id="btn-trigger-cycle" class="btn btn-primary" onclick="triggerCycle()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
           Run Cycle Now
@@ -294,6 +299,114 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=4"></script>
+  <!-- Daily Report & Master Document Modal -->
+  <div id="report-modal" class="modal-overlay">
+    <div class="modal-content report-modal-content">
+      <div class="report-modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div class="brand-icon" style="width: 32px; height: 32px; font-size: 15px;">📊</div>
+          <div>
+            <h3 style="font-size: 18px; margin: 0; display: flex; align-items: center; gap: 8px;">
+              Daily Trading Session Report
+              <span id="report-date-badge" class="thought-badge">Today</span>
+            </h3>
+            <div style="font-size: 11px; color: var(--text-dim);">Post-market trade parameters & permanent summary document</div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button class="btn btn-primary" style="padding: 6px 14px; font-size: 12px;" onclick="triggerReportGeneration()">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+            Generate / Refresh Report
+          </button>
+          <button onclick="closeReportModal()" class="btn-close-modal" aria-label="Close modal">&times;</button>
+        </div>
+      </div>
+
+      <!-- Report Content Body -->
+      <div class="report-modal-body">
+        <!-- Daily Executive Metrics Cards -->
+        <div class="report-kpi-grid">
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Initial Amount</div>
+            <div id="rep-initial-amount" class="report-kpi-value">₹10,000.00</div>
+            <div class="report-kpi-sub">Day Open Balance</div>
+          </div>
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Final Amount</div>
+            <div id="rep-final-amount" class="report-kpi-value">₹10,000.00</div>
+            <div class="report-kpi-sub">Day Close Total Equity</div>
+          </div>
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Total Trades</div>
+            <div id="rep-total-trades" class="report-kpi-value">0</div>
+            <div id="rep-trades-breakdown" class="report-kpi-sub">0 BUY / 0 SELL</div>
+          </div>
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Profit</div>
+            <div id="rep-gross-profit" class="report-kpi-value tag-positive" style="color: var(--accent-green);">₹0.00</div>
+            <div class="report-kpi-sub">Winning Trades Gains</div>
+          </div>
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Loss</div>
+            <div id="rep-gross-loss" class="report-kpi-value tag-negative" style="color: var(--accent-red);">₹0.00</div>
+            <div class="report-kpi-sub">Losing Trades Losses</div>
+          </div>
+          <div class="report-kpi-card">
+            <div class="report-kpi-title">Net P&L</div>
+            <div id="rep-net-pnl" class="report-kpi-value">₹0.00</div>
+            <div id="rep-net-return" class="report-kpi-sub">0.00% Return</div>
+          </div>
+        </div>
+
+        <!-- Master Document Section (daily_summary.txt) -->
+        <div class="card" style="background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); padding: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-weight: 600; font-size: 13px; color: var(--text-bright);">Permanent Master Document (`daily_summary.txt`)</span>
+              <span class="thought-badge" style="color: var(--accent-cyan); background: rgba(6, 182, 212, 0.12);">Appends 1 line / day</span>
+            </div>
+            <span style="font-size: 11px; color: var(--text-dim);">reports/daily_summary.txt</span>
+          </div>
+          <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px;">
+            Standard Schema: <code>Date -- Initial Amount -- Final Amount -- total number of trades -- Profit -- Loss</code>
+          </div>
+          <pre id="rep-master-doc-content" class="report-terminal-pre">Loading daily summary document...</pre>
+        </div>
+
+        <!-- Daily Trade-by-Trade Parameter Breakdown -->
+        <div class="card" style="background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); padding: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div style="font-weight: 600; font-size: 13px; color: var(--text-bright);">Daily Trades Execution Ledger (All Parameters)</div>
+            <span id="rep-charges-slip-badge" class="thought-badge" style="font-size: 11px;">Charges: ₹0.00 | Slippage: ₹0.00</span>
+          </div>
+          <div class="table-responsive" style="max-height: 260px; overflow-y: auto;">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Trade ID</th>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Req. Price</th>
+                  <th>Fill Price</th>
+                  <th>Slippage</th>
+                  <th>Charges</th>
+                  <th>Net Cash Flow</th>
+                  <th>P&L</th>
+                  <th>Reason / Strategy</th>
+                </tr>
+              </thead>
+              <tbody id="rep-trades-table-body">
+                <tr><td colspan="12" style="text-align: center; color: var(--text-dim); padding: 20px;">No trades recorded for this date.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

@@ -41,3 +41,35 @@ def test_api_trigger_cycle():
     assert response.status_code == 200
     data = response.json()
     assert "status" in data
+
+
+def test_api_report_endpoints():
+    # 1. Trigger report generation
+    gen_res = client.post("/api/reports/generate")
+    assert gen_res.status_code == 200
+    gen_data = gen_res.json()
+    assert gen_data["status"] == "SUCCESS"
+    assert "report" in gen_data
+    assert "summary_line" in gen_data
+    assert " -- " in gen_data["summary_line"]
+
+    # 2. Get daily report
+    daily_res = client.get("/api/reports/daily")
+    assert daily_res.status_code == 200
+    daily_data = daily_res.json()
+    assert "total_trades" in daily_data
+    assert "initial_amount" in daily_data
+    assert "final_amount" in daily_data
+
+    # 3. Get master summary document
+    doc_res = client.get("/api/reports/summary-document")
+    assert doc_res.status_code == 200
+    doc_data = doc_res.json()
+    assert "Date -- Initial Amount -- Final Amount -- total number of trades -- Profit -- Loss" in doc_data["content"]
+    assert len(doc_data["lines"]) >= 2
+
+    # 4. List reports
+    list_res = client.get("/api/reports/list")
+    assert list_res.status_code == 200
+    list_data = list_res.json()
+    assert "reports" in list_data
