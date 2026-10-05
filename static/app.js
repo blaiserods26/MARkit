@@ -54,10 +54,43 @@ async function fetchStatus() {
         geminiBadge.innerText = "Gemini AI: 0 Keys (Heuristic Engine)";
       }
     }
+
+    // Auto-pilot toggle button state
+    const autoBtn = document.getElementById("btn-toggle-auto");
+    if (autoBtn) {
+      if (data.auto_trading_enabled) {
+        autoBtn.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent-green);margin-right:6px;box-shadow:0 0 6px var(--accent-green);"></span>Auto-Pilot: Active`;
+        autoBtn.style.borderColor = "rgba(0, 229, 153, 0.4)";
+        autoBtn.style.color = "var(--accent-green)";
+      } else {
+        autoBtn.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent-yellow);margin-right:6px;"></span>Auto-Pilot: Paused`;
+        autoBtn.style.borderColor = "rgba(245, 158, 11, 0.4)";
+        autoBtn.style.color = "var(--accent-yellow)";
+      }
+    }
+
+    // Simulation toggle button state
+    const simBtn = document.getElementById("btn-toggle-sim");
+    if (simBtn) {
+      if (data.simulation_mode) {
+        simBtn.innerHTML = `Mode: Simulation (Active)`;
+        simBtn.style.borderColor = "rgba(6, 182, 212, 0.5)";
+        simBtn.style.color = "var(--accent-cyan)";
+      } else {
+        simBtn.innerHTML = `Mode: Live NSE Clock`;
+        simBtn.style.borderColor = "var(--border-color)";
+        simBtn.style.color = "var(--text-muted)";
+      }
+    }
+
+    // Max purchase limit on cash card
+    const cashSub = document.getElementById("metric-cash-sub");
+    if (cashSub && data.max_purchase_limit !== undefined) {
+      cashSub.innerText = `Max Order Budget: ${formatINR(data.max_purchase_limit)}`;
+    }
   } catch (e) {
     console.error("Error fetching status:", e);
   }
-
 }
 
 async function fetchPortfolio() {
@@ -236,6 +269,26 @@ async function fetchResearch() {
   }
 }
 
+async function toggleAutoTrade() {
+  try {
+    await fetch("/api/auto-trade/toggle", { method: "POST" });
+    await fetchStatus();
+    await fetchThoughts();
+  } catch (e) {
+    console.error("Error toggling auto-pilot:", e);
+  }
+}
+
+async function toggleSimulationMode() {
+  try {
+    await fetch("/api/simulation-mode/toggle", { method: "POST" });
+    await fetchStatus();
+    await fetchThoughts();
+  } catch (e) {
+    console.error("Error toggling simulation mode:", e);
+  }
+}
+
 async function triggerCycle() {
   const btn = document.getElementById("btn-trigger-cycle");
   const origText = btn.innerHTML;
@@ -299,6 +352,49 @@ async function submitOrder() {
   }
 }
 
+// Mobile View Tab Switcher
+let activeMobileTab = "all";
+
+function switchMobileTab(tab) {
+  activeMobileTab = tab;
+  document.querySelectorAll(".mobile-tab-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-tab") === tab);
+  });
+  applyMobileTabVisibility();
+}
+
+function applyMobileTabVisibility() {
+  const isMobile = window.innerWidth <= 991;
+  const cards = document.querySelectorAll(".dashboard-col .card");
+  
+  if (!isMobile) {
+    cards.forEach(c => c.style.display = "");
+    const colMarket = document.getElementById("col-market");
+    const colIntel = document.getElementById("col-intel");
+    if (colMarket) colMarket.style.display = "";
+    if (colIntel) colIntel.style.display = "";
+    return;
+  }
+
+  cards.forEach(card => {
+    const cat = card.getAttribute("data-category");
+    if (activeMobileTab === "all" || cat === activeMobileTab) {
+      card.style.display = "flex";
+    } else {
+      card.style.display = "none";
+    }
+  });
+
+  ["col-market", "col-intel"].forEach(colId => {
+    const col = document.getElementById(colId);
+    if (!col) return;
+    const hasVisibleCard = Array.from(col.querySelectorAll(".card")).some(c => c.style.display !== "none");
+    col.style.display = hasVisibleCard ? "flex" : "none";
+  });
+}
+
+window.addEventListener("resize", applyMobileTabVisibility);
+
 // Initial boot & recurring polls
 window.addEventListener("DOMContentLoaded", () => {
   fetchStatus();
@@ -306,6 +402,7 @@ window.addEventListener("DOMContentLoaded", () => {
   loadWatchlist();
   fetchThoughts();
   fetchResearch();
+  applyMobileTabVisibility();
 
   // Poll status & thoughts every 4 seconds
   setInterval(fetchStatus, 4000);

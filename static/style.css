@@ -211,6 +211,68 @@ body {
   border-color: rgba(255, 255, 255, 0.18);
 }
 
+.header-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Mobile Tabs Navigation */
+.mobile-tabs {
+  display: none;
+  gap: 6px;
+  padding: 4px;
+  background: rgba(16, 21, 34, 0.7);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-tab-btn {
+  flex: 1;
+  min-width: fit-content;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: var(--transition-smooth);
+}
+
+.mobile-tab-btn.active {
+  background: rgba(0, 229, 153, 0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(0, 229, 153, 0.3);
+  box-shadow: 0 0 12px rgba(0, 229, 153, 0.2);
+}
+
+/* Responsive Table Wrapper */
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table-scroll-hint {
+  display: none;
+  font-size: 11px;
+  color: var(--text-dim);
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
 /* App Main Container */
 .dashboard-container {
   max-width: 1600px;
@@ -279,10 +341,6 @@ body {
   display: grid;
   grid-template-columns: 1fr 1.35fr;
   gap: 24px;
-}
-
-@media (max-width: 1200px) {
-  .main-grid { grid-template-columns: 1fr; }
 }
 
 .card {
@@ -506,3 +564,259 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* ==========================================================================
+   Responsive Breakpoints & Mobile Optimization
+   ========================================================================== */
+
+/* Tablet & Smaller Desktop View (<= 1200px) */
+@media (max-width: 1200px) {
+  .main-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .header-controls {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+}
+
+/* Tablet & Mobile Breakpoint (<= 991px) */
+@media (max-width: 991px) {
+  .mobile-tabs {
+    display: flex;
+  }
+
+  .dashboard-col {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .dashboard-container {
+    padding: 18px 14px;
+    gap: 18px;
+  }
+}
+
+/* Mobile Smartphone Optimization (<= 768px) */
+@media (max-width: 768px) {
+  body {
+    padding-bottom: env(safe-area-inset-bottom, 16px);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Header adjustments */
+  .navbar {
+    padding: 12px 14px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    position: relative;
+  }
+
+  .brand-section {
+    width: 100%;
+    justify-content: flex-start;
+    gap: 10px;
+  }
+
+  .brand-icon {
+    width: 34px;
+    height: 34px;
+    font-size: 16px;
+  }
+
+  .brand-title {
+    font-size: 18px;
+    letter-spacing: -0.3px;
+  }
+
+  .brand-badge {
+    font-size: 9.5px;
+    padding: 2px 7px;
+  }
+
+  .header-controls {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    gap: 8px;
+  }
+
+  .clock-pill {
+    width: 100%;
+    justify-content: space-between;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    border-radius: 8px;
+  }
+
+  #market-status-pill {
+    font-size: 10px;
+    padding: 3px 8px;
+  }
+
+  #gemini-status-badge {
+    display: block;
+    text-align: center;
+    width: 100%;
+    font-size: 11px;
+    padding: 6px 10px;
+    border-radius: 8px;
+  }
+
+  /* 2x2 grid for action buttons on mobile */
+  .header-action-buttons {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .header-action-buttons .btn {
+    width: 100%;
+    justify-content: center;
+    font-size: 11.5px;
+    padding: 10px 6px;
+    min-height: 42px;
+    border-radius: var(--radius-sm);
+  }
+
+  /* Main container */
+  .dashboard-container {
+    padding: 12px;
+    gap: 14px;
+  }
+
+  /* Executive Metrics: 2-column grid with Total Equity spanning full width */
+  .metrics-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .metric-card:first-child {
+    grid-column: span 2;
+    padding: 16px;
+    background: linear-gradient(135deg, rgba(0, 229, 153, 0.09) 0%, rgba(18, 24, 38, 0.95) 100%);
+    border-color: rgba(0, 229, 153, 0.28);
+    box-shadow: 0 4px 18px rgba(0, 229, 153, 0.08);
+  }
+
+  .metric-card:first-child .metric-value {
+    font-size: 26px;
+  }
+
+  .metric-card {
+    padding: 12px 10px;
+    gap: 4px;
+  }
+
+  .metric-header {
+    font-size: 11px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .metric-value {
+    font-size: 19px;
+  }
+
+  .metric-footer {
+    font-size: 10px;
+  }
+
+  /* Card layouts */
+  .card {
+    padding: 14px 12px;
+    gap: 12px;
+  }
+
+  .card-title {
+    font-size: 14px;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  /* Table optimizations */
+  .data-table {
+    min-width: 520px;
+  }
+
+  .data-table th {
+    padding: 8px 10px;
+    font-size: 10px;
+  }
+
+  .data-table td {
+    padding: 9px 10px;
+    font-size: 12px;
+  }
+
+  .table-scroll-hint {
+    display: flex;
+  }
+
+  /* Thought stream console */
+  .thought-console {
+    height: 320px;
+    font-size: 11px;
+    padding: 10px;
+  }
+
+  /* Research / news */
+  .news-item {
+    padding: 10px;
+  }
+
+  .news-title {
+    font-size: 12px;
+  }
+
+  /* Modal bottom-sheet/responsive mobile styling */
+  .modal-overlay {
+    padding: 12px;
+  }
+
+  .modal-content {
+    width: 100%;
+    max-width: 100%;
+    padding: 20px 16px;
+    gap: 14px;
+  }
+
+  .form-control {
+    font-size: 16px; /* Prevents iOS auto-zoom on input focus */
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+
+  .form-group label {
+    font-size: 11.5px;
+  }
+}
+
+/* Extra small devices (<= 380px) */
+@media (max-width: 380px) {
+  .metric-value {
+    font-size: 17px;
+  }
+
+  .metric-card:first-child .metric-value {
+    font-size: 22px;
+  }
+
+  .header-action-buttons .btn {
+    font-size: 10.5px;
+    padding: 8px 4px;
+  }
+
+  .mobile-tab-btn {
+    font-size: 11px;
+    padding: 7px 10px;
+  }
+}
+

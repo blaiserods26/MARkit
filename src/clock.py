@@ -28,8 +28,12 @@ class MarketState(str, Enum):
 
 
 class MarketClock:
-    def __init__(self, timezone_str: str = "Asia/Kolkata"):
+    def __init__(self, timezone_str: str = "Asia/Kolkata", simulation_mode: bool = False):
         self.tz = pytz.timezone(timezone_str)
+        self.simulation_mode = simulation_mode
+
+    def set_simulation_mode(self, enabled: bool) -> None:
+        self.simulation_mode = enabled
 
     def now(self) -> datetime:
         """Return the current localized time in Indian Standard Time (IST)."""
@@ -38,7 +42,11 @@ class MarketClock:
     def get_market_state(self, dt: Optional[datetime] = None) -> MarketState:
         """
         Determine the current state of the Indian market.
+        If simulation_mode is enabled and no explicit mock datetime is provided, returns ACTIVE_MARKET.
         """
+        if dt is None and self.simulation_mode:
+            return MarketState.ACTIVE_MARKET
+
         current_dt = dt or self.now()
         if current_dt.tzinfo is None:
             current_dt = self.tz.localize(current_dt)
@@ -75,6 +83,9 @@ class MarketClock:
         Check whether order entry (BUY) is allowed right now.
         Returns (is_allowed, reason_description).
         """
+        if dt is None and self.simulation_mode:
+            return True, "Simulation Mode Active (Intraday Paper Trading)"
+
         state = self.get_market_state(dt)
         current_dt = dt or self.now()
         if current_dt.weekday() in (5, 6):

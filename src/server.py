@@ -4,9 +4,11 @@ Exposes endpoints for portfolio state, market data, agent thought logs,
 research summaries, and manual simulation controls.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
+import logging
 import os
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
@@ -22,6 +24,8 @@ from src.ledger import OrderSide, VirtualLedger
 from src.market_data import MarketDataProvider
 from src.research import NewsResearcher
 
+logger = logging.getLogger(__name__)
+
 # Initialize core singletons
 market_data_provider = MarketDataProvider()
 virtual_ledger = VirtualLedger(initial_cash=10000.0, persistence_path="data/ledger.json")
@@ -36,16 +40,60 @@ trading_agent = TradingAgent(
     gemini_rotator=gemini_rotator,
 )
 
+# Autonomous trading loop controls
+auto_trading_enabled: bool = True
+cycle_interval_seconds: int = 15
+_autonomous_task: Optional[asyncio.Task] = None
+
+
+async def autonomous_trading_worker():
+    """
+    Background worker that runs autonomous trading cycles periodically.
+    Enforces intraday limits, evaluates held positions for selling,
+    and scans watchlist for buying up to remaining cash budget.
+    """
+    logger.info("Starting autonomous trading worker loop...")
+    try:
+        await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        return
+
+    while True:
+        try:
+            if auto_trading_enabled and not os.environ.get("PYTEST_CURRENT_TEST"):
+                await asyncio.to_thread(trading_agent.execute_trade_cycle)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception(f"Exception in autonomous trading worker: {e}")
+        try:
+            await asyncio.sleep(cycle_interval_seconds)
+        except asyncio.CancelledError:
+            break
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initial startup log
-    key_msg = f"{gemini_rotator.key_count} keys active (random rotation)" if gemini_rotator.key_count > 0 else "0 keys configured (heuristic engine active)"
+    global _autonomous_task
+    key_msg = (
+        f"{gemini_rotator.key_count} keys active (random rotation)"
+        if gemini_rotator.key_count > 0
+        else "0 keys configured (heuristic engine active)"
+    )
     trading_agent.log_thought(
-        thought=f"MARkit Trading Engine initialized. Paper capital: ₹10,000.00 INR. Gemini AI: {key_msg}.",
+        thought=f"MARkit Autonomous Trading Engine initialized. Paper capital: ₹{virtual_ledger.cash_balance:.2f} INR. Gemini AI: {key_msg}. Auto-Pilot: ACTIVE.",
         action="SYSTEM_INIT",
     )
+    # Start autonomous trading background worker
+    _autonomous_task = asyncio.create_task(autonomous_trading_worker())
     yield
+    # Graceful shutdown
+    if _autonomous_task:
+        _autonomous_task.cancel()
+        try:
+            await _autonomous_task
+        except asyncio.CancelledError:
+            pass
 
 
 
@@ -96,6 +144,9 @@ def get_system_status():
         "circuit_breaker_triggered": virtual_ledger.circuit_breaker_triggered,
         "open_positions_count": len(virtual_ledger.positions),
         "gemini_keys_configured": gemini_rotator.key_count,
+        "auto_trading_enabled": auto_trading_enabled,
+        "simulation_mode": market_clock.simulation_mode,
+        "max_purchase_limit": virtual_ledger.get_max_purchase_value(),
     }
 
 
@@ -146,6 +197,7 @@ def get_portfolio():
         "realized_pnl": virtual_ledger.realized_pnl,
         "daily_drawdown_pct": virtual_ledger.daily_drawdown_pct,
         "circuit_breaker_triggered": virtual_ledger.circuit_breaker_triggered,
+        "max_purchase_limit": virtual_ledger.get_max_purchase_value(),
         "positions": positions_list,
         "trades": trades_list,
     }
@@ -189,6 +241,40 @@ def get_thought_logs(limit: int = 50):
     return {"thoughts": trading_agent.get_thought_logs(limit=limit)}
 
 
+@app.get("/api/auto-trade/status")
+def get_auto_trade_status():
+    return {
+        "auto_trading_enabled": auto_trading_enabled,
+        "simulation_mode": market_clock.simulation_mode,
+        "cycle_interval_seconds": cycle_interval_seconds,
+        "max_purchase_limit": virtual_ledger.get_max_purchase_value(),
+        "remaining_cash": virtual_ledger.cash_balance,
+    }
+
+
+@app.post("/api/auto-trade/toggle")
+def toggle_auto_trade():
+    global auto_trading_enabled
+    auto_trading_enabled = not auto_trading_enabled
+    state_str = "ENABLED" if auto_trading_enabled else "PAUSED"
+    trading_agent.log_thought(
+        thought=f"Auto-pilot autonomous trading {state_str} by operator.",
+        action="AUTONOMOUS_TOGGLE",
+    )
+    return {"auto_trading_enabled": auto_trading_enabled}
+
+
+@app.post("/api/simulation-mode/toggle")
+def toggle_simulation_mode():
+    market_clock.simulation_mode = not market_clock.simulation_mode
+    state_str = "ENABLED (Active intraday paper trading)" if market_clock.simulation_mode else "DISABLED (Live NSE Clock)"
+    trading_agent.log_thought(
+        thought=f"Simulation mode {state_str}.",
+        action="SIMULATION_TOGGLE",
+    )
+    return {"simulation_mode": market_clock.simulation_mode}
+
+
 @app.post("/api/trigger-cycle")
 def trigger_agent_cycle():
     result = trading_agent.execute_trade_cycle()
@@ -209,6 +295,21 @@ def execute_manual_order(req: ManualOrderRequest):
         side = OrderSide.BUY if req.side.upper() == "BUY" else OrderSide.SELL
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid order side. Must be BUY or SELL.")
+
+    if side == OrderSide.SELL and req.symbol not in virtual_ledger.positions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot sell {req.symbol}: Stock was not purchased before. Intraday trading rules require purchasing before selling."
+        )
+
+    if side == OrderSide.BUY:
+        max_allowed = virtual_ledger.get_max_purchase_value()
+        order_val = quote.price * req.quantity
+        if order_val > max_allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Order value ₹{order_val:.2f} exceeds remaining allowable purchase limit of ₹{max_allowed:.2f}."
+            )
 
     res = virtual_ledger.execute_order(
         symbol=req.symbol,
@@ -235,7 +336,7 @@ def execute_manual_order(req: ManualOrderRequest):
 @app.post("/api/square-off-all")
 def emergency_square_off():
     prices = {}
-    for sym in virtual_ledger.positions.keys():
+    for sym in list(virtual_ledger.positions.keys()):
         q = market_data_provider.get_live_quote(sym)
         if q:
             prices[sym] = q.price
@@ -255,5 +356,12 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def serve_index():
     index_path = os.path.join("static", "index.html")
     if os.path.exists(index_path):
-        return FileResponse(index_path)
+        return FileResponse(
+            index_path,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     return HTMLResponse("<h1>MARkit Trading Server is Running</h1>")

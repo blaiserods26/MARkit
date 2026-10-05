@@ -18,6 +18,6 @@ if __name__ == "__main__":
     print("  🚀 MARkit: Autonomous Indian Stock Market AI Trading Agent")
     print("  📈 Paper Trading Simulation (Real-Time NSE Feeds)")
     print("  ⏰ Market Schedule: 09:15 - 15:30 IST (Asia/Kolkata)")
-    print("  🌐 Dashboard running at: http://127.0.0.1:8000")
+    print("  🌐 Dashboard running at: http://localhost:8000 (LAN: http://0.0.0.0:8000)")
     print("=" * 65)
-    uvicorn.run("src.server:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("src.server:app", host="0.0.0.0", port=8000, reload=False)

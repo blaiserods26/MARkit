@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
   <title>MARkit — Autonomous AI Trading Agent (NSE/BSE)</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
   <!-- Navigation Header -->
@@ -32,14 +32,24 @@
         Gemini: Checking...
       </span>
 
-      <button id="btn-trigger-cycle" class="btn btn-primary" onclick="triggerCycle()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-        Run Agent Cycle
-      </button>
+      <div class="header-action-buttons">
+        <button id="btn-toggle-auto" class="btn btn-secondary" onclick="toggleAutoTrade()" title="Toggle autonomous agent cycle loop">
+          Auto-Pilot: Active
+        </button>
 
-      <button id="btn-squareoff-all" class="btn btn-danger" onclick="emergencySquareOff()">
-        Square-Off All
-      </button>
+        <button id="btn-toggle-sim" class="btn btn-secondary" onclick="toggleSimulationMode()" title="Toggle between real-time NSE clock and Intraday Paper Simulation">
+          Market: Live NSE
+        </button>
+
+        <button id="btn-trigger-cycle" class="btn btn-primary" onclick="triggerCycle()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+          Run Cycle Now
+        </button>
+
+        <button id="btn-squareoff-all" class="btn btn-danger" onclick="emergencySquareOff()">
+          Square-Off All
+        </button>
+      </div>
     </div>
   </header>
 
@@ -93,12 +103,32 @@
       </div>
     </section>
 
+    <!-- Mobile Navigation Tabs (visible on mobile / tablet) -->
+    <div class="mobile-tabs" id="mobile-tabs">
+      <button class="mobile-tab-btn active" data-tab="all" onclick="switchMobileTab('all')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+        Overview
+      </button>
+      <button class="mobile-tab-btn" data-tab="market" onclick="switchMobileTab('market')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline><polyline points="17 6 23 6 23 12"></polyline></svg>
+        Market & Trades
+      </button>
+      <button class="mobile-tab-btn" data-tab="brain" onclick="switchMobileTab('brain')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a8 8 0 0 0-8 8c0 3.5 2.2 6.5 5.5 7.6V20a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-2.4C17.8 16.5 20 13.5 20 10a8 8 0 0 0-8-8z"></path></svg>
+        Agent Brain
+      </button>
+      <button class="mobile-tab-btn" data-tab="research" onclick="switchMobileTab('research')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"></path></svg>
+        News
+      </button>
+    </div>
+
     <!-- Content Columns -->
     <div class="main-grid">
       <!-- Left Column: Watchlist, Active Positions, Trade Log -->
-      <div style="display: flex; flex-direction: column; gap: 24px;">
+      <div id="col-market" class="dashboard-col" style="display: flex; flex-direction: column; gap: 24px;">
         <!-- Live Market Watchlist Card -->
-        <div class="card">
+        <div class="card" id="card-watchlist" data-category="market">
           <div class="card-title">
             <div class="card-title-left">
               <span>NIFTY 50 Live Watchlist</span>
@@ -106,7 +136,7 @@
             </div>
             <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 11px;" onclick="loadWatchlist()">Refresh</button>
           </div>
-          <div style="overflow-x: auto;">
+          <div class="table-responsive">
             <table class="data-table">
               <thead>
                 <tr>
@@ -122,10 +152,14 @@
               </tbody>
             </table>
           </div>
+          <div class="table-scroll-hint">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+            Swipe horizontally to see day range & trade actions
+          </div>
         </div>
 
         <!-- Open Intraday Positions Card -->
-        <div class="card">
+        <div class="card" id="card-positions" data-category="market">
           <div class="card-title">
             <div class="card-title-left">
               <span>Open Intraday Positions</span>
@@ -133,7 +167,7 @@
             </div>
             <span style="font-size: 11px; color: var(--text-dim);">Auto Square-Off at 15:15 IST</span>
           </div>
-          <div style="overflow-x: auto;">
+          <div class="table-responsive">
             <table class="data-table">
               <thead>
                 <tr>
@@ -150,17 +184,21 @@
               </tbody>
             </table>
           </div>
+          <div class="table-scroll-hint">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+            Swipe horizontally for SL & Target prices
+          </div>
         </div>
 
         <!-- Execution & Order History Card -->
-        <div class="card">
+        <div class="card" id="card-trades" data-category="market">
           <div class="card-title">
             <div class="card-title-left">
               <span>Execution Log & Paper Ledger</span>
               <span class="thought-badge">Indian Regulatory Friction</span>
             </div>
           </div>
-          <div style="max-height: 280px; overflow-y: auto;">
+          <div class="table-responsive" style="max-height: 280px; overflow-y: auto;">
             <table class="data-table">
               <thead>
                 <tr>
@@ -178,13 +216,17 @@
               </tbody>
             </table>
           </div>
+          <div class="table-scroll-hint">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+            Swipe horizontally for trade charges & P&L
+          </div>
         </div>
       </div>
 
       <!-- Right Column: Agent Brain Console & Market Research -->
-      <div style="display: flex; flex-direction: column; gap: 24px;">
+      <div id="col-intel" class="dashboard-col" style="display: flex; flex-direction: column; gap: 24px;">
         <!-- Agent Reasoning Stream -->
-        <div class="card">
+        <div class="card" id="card-brain" data-category="brain">
           <div class="card-title">
             <div class="card-title-left">
               <span>Agent Thought Stream</span>
@@ -204,7 +246,7 @@
         </div>
 
         <!-- Financial Research & Market Intelligence Card -->
-        <div class="card">
+        <div class="card" id="card-research" data-category="research">
           <div class="card-title">
             <div class="card-title-left">
               <span>Market Research & Pre-Market Briefing</span>
@@ -252,6 +294,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

@@ -18,8 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class GeminiKeyRotator:
-    def __init__(self, keys: Optional[List[str]] = None, default_model: str = "gemini-1.5-flash"):
-        self.default_model = default_model
+    def __init__(self, keys: Optional[List[str]] = None, default_model: Optional[str] = None):
+        self.default_model = default_model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        self.fallback_models = [
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-flash-latest",
+            "gemini-2.5-flash-lite",
+        ]
         self.keys: List[str] = []
 
         if keys is not None:
@@ -81,9 +87,21 @@ class GeminiKeyRotator:
 
         def _call_gemini(key: str, p: str) -> str:
             genai.configure(api_key=key)
-            llm = genai.GenerativeModel(model)
-            response = llm.generate_content(p, **kwargs)
-            return response.text
+            models_to_try = [model] + [m for m in self.fallback_models if m != model]
+            last_err = None
+            for m_name in models_to_try:
+                try:
+                    llm = genai.GenerativeModel(m_name)
+                    response = llm.generate_content(p, **kwargs)
+                    return response.text
+                except Exception as ex:
+                    last_err = ex
+                    if "404" in str(ex) or "not found" in str(ex).lower():
+                        continue
+                    raise ex
+            if last_err:
+                raise last_err
+            raise RuntimeError("No suitable Gemini model found")
 
         return self._call_with_fallback(prompt, _call_gemini)
 

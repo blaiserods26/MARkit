@@ -131,6 +131,22 @@ class VirtualLedger:
         drawdown = max(0.0, self.day_start_equity - self.total_equity)
         return round((drawdown / self.day_start_equity) * 100, 2)
 
+    def get_max_purchase_value(self) -> float:
+        """
+        Maximum purchase value allowed for any new position:
+        Strictly capped by the 30% allocation ceiling of total equity,
+        and cannot exceed remaining cash balance (with 5% buffer for statutory charges).
+        """
+        max_by_equity = round(self.total_equity * self.max_allocation_pct, 2)
+        max_by_cash = round(max(0.0, self.cash_balance * 0.95), 2)
+        return round(min(max_by_equity, max_by_cash), 2)
+
+    def get_max_buy_quantity(self, price: float) -> int:
+        """Calculate maximum buyable shares of a stock given remaining allowable cash value."""
+        if price <= 0:
+            return 0
+        return int(self.get_max_purchase_value() // price)
+
     def execute_order(
         self,
         symbol: str,
@@ -227,7 +243,7 @@ class VirtualLedger:
 
             return TradeResult(
                 status=OrderStatus.FILLED,
-                message=f"Bought {quantity} shares of {symbol} at ₹{filled_price} (Charges: ₹{charges}).",
+                message=f"Bought {quantity} shares of {symbol} at ₹{filled_price}. Cash debited: ₹{total_req:.2f} (Charges: ₹{charges:.2f}). Remaining cash: ₹{self.cash_balance:.2f}.",
                 trade=trade,
                 filled_price=filled_price,
                 charges=charges,
@@ -238,7 +254,7 @@ class VirtualLedger:
                 avail = self.positions[symbol].quantity if symbol in self.positions else 0
                 return TradeResult(
                     status=OrderStatus.REJECTED,
-                    message=f"Cannot sell {quantity} shares of {symbol}. Available position: {avail}.",
+                    message=f"Cannot sell {quantity} shares of {symbol}. Available position: {avail}. Stocks must be purchased before selling.",
                 )
 
             pos = self.positions[symbol]
@@ -276,7 +292,7 @@ class VirtualLedger:
 
             return TradeResult(
                 status=OrderStatus.FILLED,
-                message=f"Sold {quantity} shares of {symbol} at ₹{filled_price}. Net P&L: ₹{trade_pnl}.",
+                message=f"Sold {quantity} shares of {symbol} at ₹{filled_price}. Cash credited: ₹{net_credit:.2f} (Charges: ₹{charges:.2f}). Net P&L: ₹{trade_pnl:.2f}. Updated cash: ₹{self.cash_balance:.2f}.",
                 trade=trade,
                 filled_price=filled_price,
                 charges=charges,
