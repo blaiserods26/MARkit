@@ -35,11 +35,15 @@ class Position:
     stop_loss: Optional[float] = None
     target: Optional[float] = None
     highest_price: float = 0.0
+    lowest_price: float = 0.0
+    side: OrderSide = OrderSide.BUY
     opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def __post_init__(self):
         if self.highest_price <= 0:
             self.highest_price = max(self.current_price, self.average_entry_price)
+        if self.lowest_price <= 0:
+            self.lowest_price = min(self.current_price, self.average_entry_price)
 
     @property
     def market_value(self) -> float:
@@ -47,12 +51,16 @@ class Position:
 
     @property
     def unrealized_pnl(self) -> float:
+        if self.side == OrderSide.SELL:  # SHORT
+            return round(self.quantity * (self.average_entry_price - self.current_price), 2)
         return round(self.quantity * (self.current_price - self.average_entry_price), 2)
 
     @property
     def unrealized_pnl_pct(self) -> float:
         if self.average_entry_price <= 0:
             return 0.0
+        if self.side == OrderSide.SELL:  # SHORT
+            return round(((self.average_entry_price - self.current_price) / self.average_entry_price) * 100, 2)
         return round(((self.current_price - self.average_entry_price) / self.average_entry_price) * 100, 2)
 
     def update_price(self, new_price: float) -> None:
@@ -62,21 +70,33 @@ class Position:
         else:
             self.highest_price = max(self.highest_price, new_price)
 
+        if self.lowest_price <= 0:
+            self.lowest_price = min(new_price, self.average_entry_price)
+        else:
+            self.lowest_price = min(self.lowest_price, new_price)
+
     def check_trailing_stop(self, activation_gain_pct: float = 0.015, trail_distance_pct: float = 0.0075) -> Optional[float]:
         """
-        Dynamic trailing stop:
-        Activates when unrealized gain reaches +1.5% from average entry.
-        Trails the highest watermark price by 0.75%.
-        Returns new stop_loss if updated, else None.
+        Dynamic trailing stop for LONG and SHORT.
+        Activates when unrealized gain reaches +1.5% from entry.
+        Trails watermark by 0.75%.
         """
-        if self.highest_price <= 0 or self.average_entry_price <= 0:
+        if self.average_entry_price <= 0:
             return None
-        max_gain_pct = (self.highest_price - self.average_entry_price) / self.average_entry_price
-        if max_gain_pct >= activation_gain_pct:
-            new_sl = round(self.highest_price * (1.0 - trail_distance_pct), 2)
-            if self.stop_loss is None or new_sl > self.stop_loss:
-                self.stop_loss = new_sl
-                return new_sl
+        if self.side == OrderSide.BUY:  # LONG
+            max_gain_pct = (self.highest_price - self.average_entry_price) / self.average_entry_price
+            if max_gain_pct >= activation_gain_pct:
+                new_sl = round(self.highest_price * (1.0 - trail_distance_pct), 2)
+                if self.stop_loss is None or new_sl > self.stop_loss:
+                    self.stop_loss = new_sl
+                    return new_sl
+        else:  # SHORT
+            max_gain_pct = (self.average_entry_price - self.lowest_price) / self.average_entry_price
+            if max_gain_pct >= activation_gain_pct:
+                new_sl = round(self.lowest_price * (1.0 + trail_distance_pct), 2)
+                if self.stop_loss is None or new_sl < self.stop_loss:
+                    self.stop_loss = new_sl
+                    return new_sl
         return None
 
 
@@ -185,6 +205,7 @@ class VirtualLedger:
         stop_loss: Optional[float] = None,
         target: Optional[float] = None,
         reason: str = "",
+        allow_short: bool = False,
     ) -> TradeResult:
         if quantity <= 0:
             return TradeResult(status=OrderStatus.REJECTED, message="Quantity must be greater than zero.")
@@ -210,8 +231,49 @@ class VirtualLedger:
         turnover = filled_price * quantity
         charges = calculate_indian_charges(side, turnover)
 
+        # CASE 1: BUY order
         if side == OrderSide.BUY:
-            # Enforce max 30% capital allocation per position
+            # Check if this BUY covers an active SHORT position
+            if symbol in self.positions and self.positions[symbol].side == OrderSide.SELL:
+                pos = self.positions[symbol]
+                cost_basis = pos.average_entry_price * quantity
+                trade_pnl = round(cost_basis - turnover - charges, 2)
+                net_credit = round((pos.average_entry_price * quantity) + trade_pnl, 2)
+
+                self.cash_balance = round(self.cash_balance + net_credit, 2)
+                self.realized_pnl = round(self.realized_pnl + trade_pnl, 2)
+
+                pos.quantity -= quantity
+                if pos.quantity <= 0:
+                    del self.positions[symbol]
+
+                trade = TradeRecord(
+                    trade_id=f"TRD-{len(self.trades) + 1:04d}",
+                    symbol=symbol,
+                    side=OrderSide.BUY,
+                    quantity=quantity,
+                    requested_price=current_price,
+                    filled_price=filled_price,
+                    slippage=slippage,
+                    charges=charges,
+                    net_amount=turnover,
+                    pnl=trade_pnl,
+                    reason=reason,
+                )
+                self.trades.append(trade)
+                if self.daily_drawdown_pct >= (self.circuit_breaker_pct * 100):
+                    self.circuit_breaker_triggered = True
+                self._save()
+
+                return TradeResult(
+                    status=OrderStatus.FILLED,
+                    message=f"Covered short {quantity} shares of {symbol} at ₹{filled_price}. Cash returned: ₹{net_credit:.2f}. Net P&L: ₹{trade_pnl:.2f}. Updated cash: ₹{self.cash_balance:.2f}.",
+                    trade=trade,
+                    filled_price=filled_price,
+                    charges=charges,
+                )
+
+            # Regular LONG position entry
             max_allowed = self.total_equity * self.max_allocation_pct
             total_req = turnover + charges
 
@@ -227,10 +289,8 @@ class VirtualLedger:
                     message=f"Insufficient funds. Required: ₹{total_req:.2f}, Available: ₹{self.cash_balance:.2f}.",
                 )
 
-            # Deduct cash
             self.cash_balance = round(self.cash_balance - total_req, 2)
 
-            # Update or create position
             if symbol in self.positions:
                 existing = self.positions[symbol]
                 new_qty = existing.quantity + quantity
@@ -252,6 +312,7 @@ class VirtualLedger:
                     current_price=filled_price,
                     stop_loss=stop_loss,
                     target=target,
+                    side=OrderSide.BUY,
                 )
 
             trade = TradeRecord(
@@ -278,65 +339,127 @@ class VirtualLedger:
                 charges=charges,
             )
 
+        # CASE 2: SELL order
         elif side == OrderSide.SELL:
-            if symbol not in self.positions or self.positions[symbol].quantity < quantity:
+            # Check if this SELL closes an active LONG position
+            if symbol in self.positions and self.positions[symbol].side == OrderSide.BUY:
+                pos = self.positions[symbol]
+                if pos.quantity < quantity:
+                    return TradeResult(
+                        status=OrderStatus.REJECTED,
+                        message=f"Cannot sell {quantity} shares of {symbol}. Available position: {pos.quantity}.",
+                    )
+
+                cost_basis = pos.average_entry_price * quantity
+                trade_pnl = round(turnover - cost_basis - charges, 2)
+                net_credit = round(turnover - charges, 2)
+
+                self.cash_balance = round(self.cash_balance + net_credit, 2)
+                self.realized_pnl = round(self.realized_pnl + trade_pnl, 2)
+
+                pos.quantity -= quantity
+                if pos.quantity <= 0:
+                    del self.positions[symbol]
+
+                trade = TradeRecord(
+                    trade_id=f"TRD-{len(self.trades) + 1:04d}",
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    quantity=quantity,
+                    requested_price=current_price,
+                    filled_price=filled_price,
+                    slippage=slippage,
+                    charges=charges,
+                    net_amount=net_credit,
+                    pnl=trade_pnl,
+                    reason=reason,
+                )
+                self.trades.append(trade)
+
+                if self.daily_drawdown_pct >= (self.circuit_breaker_pct * 100):
+                    self.circuit_breaker_triggered = True
+
+                self._save()
+
+                return TradeResult(
+                    status=OrderStatus.FILLED,
+                    message=f"Sold {quantity} shares of {symbol} at ₹{filled_price}. Cash credited: ₹{net_credit:.2f} (Charges: ₹{charges:.2f}). Net P&L: ₹{trade_pnl:.2f}. Updated cash: ₹{self.cash_balance:.2f}.",
+                    trade=trade,
+                    filled_price=filled_price,
+                    charges=charges,
+                )
+
+            # Not holding long: check if allow_short is permitted
+            elif not allow_short:
                 avail = self.positions[symbol].quantity if symbol in self.positions else 0
                 return TradeResult(
                     status=OrderStatus.REJECTED,
                     message=f"Cannot sell {quantity} shares of {symbol}. Available position: {avail}. Stocks must be purchased before selling.",
                 )
 
-            pos = self.positions[symbol]
-            cost_basis = pos.average_entry_price * quantity
-            trade_pnl = round(turnover - cost_basis - charges, 2)
-            net_credit = round(turnover - charges, 2)
+            else:
+                # Open Intraday Short position
+                max_allowed = self.total_equity * self.max_allocation_pct
+                total_req = turnover + charges
 
-            self.cash_balance = round(self.cash_balance + net_credit, 2)
-            self.realized_pnl = round(self.realized_pnl + trade_pnl, 2)
+                if turnover > max_allowed:
+                    return TradeResult(
+                        status=OrderStatus.REJECTED,
+                        message=f"Short order exceeds max allocation limit of ₹{max_allowed:.2f} (Requested ₹{turnover:.2f}).",
+                    )
 
-            pos.quantity -= quantity
-            if pos.quantity <= 0:
-                del self.positions[symbol]
+                if total_req > self.cash_balance:
+                    return TradeResult(
+                        status=OrderStatus.REJECTED,
+                        message=f"Insufficient funds for short margin. Required: ₹{total_req:.2f}, Available: ₹{self.cash_balance:.2f}.",
+                    )
 
-            trade = TradeRecord(
-                trade_id=f"TRD-{len(self.trades) + 1:04d}",
-                symbol=symbol,
-                side=OrderSide.SELL,
-                quantity=quantity,
-                requested_price=current_price,
-                filled_price=filled_price,
-                slippage=slippage,
-                charges=charges,
-                net_amount=net_credit,
-                pnl=trade_pnl,
-                reason=reason,
-            )
-            self.trades.append(trade)
+                self.cash_balance = round(self.cash_balance - total_req, 2)
+                self.positions[symbol] = Position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    average_entry_price=filled_price,
+                    current_price=filled_price,
+                    stop_loss=stop_loss,
+                    target=target,
+                    side=OrderSide.SELL,
+                )
 
-            # Check if circuit breaker tripped after loss
-            if self.daily_drawdown_pct >= (self.circuit_breaker_pct * 100):
-                self.circuit_breaker_triggered = True
+                trade = TradeRecord(
+                    trade_id=f"TRD-{len(self.trades) + 1:04d}",
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    quantity=quantity,
+                    requested_price=current_price,
+                    filled_price=filled_price,
+                    slippage=slippage,
+                    charges=charges,
+                    net_amount=total_req,
+                    pnl=0.0,
+                    reason=reason,
+                )
+                self.trades.append(trade)
+                self._save()
 
-            self._save()
-
-            return TradeResult(
-                status=OrderStatus.FILLED,
-                message=f"Sold {quantity} shares of {symbol} at ₹{filled_price}. Cash credited: ₹{net_credit:.2f} (Charges: ₹{charges:.2f}). Net P&L: ₹{trade_pnl:.2f}. Updated cash: ₹{self.cash_balance:.2f}.",
-                trade=trade,
-                filled_price=filled_price,
-                charges=charges,
-            )
+                return TradeResult(
+                    status=OrderStatus.FILLED,
+                    message=f"Short sold {quantity} shares of {symbol} at ₹{filled_price}. Margin held: ₹{total_req:.2f}. Remaining cash: ₹{self.cash_balance:.2f}.",
+                    trade=trade,
+                    filled_price=filled_price,
+                    charges=charges,
+                )
 
         return TradeResult(status=OrderStatus.REJECTED, message="Unsupported order side.")
 
     def square_off_all(self, current_prices: Dict[str, float], reason: str = "Auto Square-Off") -> List[TradeResult]:
-        """Square off all active positions."""
+        """Square off all active positions (both long and short)."""
         results: List[TradeResult] = []
         for symbol, pos in list(self.positions.items()):
             price = current_prices.get(symbol, pos.current_price)
+            close_side = OrderSide.BUY if pos.side == OrderSide.SELL else OrderSide.SELL
             res = self.execute_order(
                 symbol=symbol,
-                side=OrderSide.SELL,
+                side=close_side,
                 quantity=pos.quantity,
                 current_price=price,
                 reason=reason,
@@ -368,6 +491,8 @@ class VirtualLedger:
                     "target": p.target,
                     "opened_at": p.opened_at,
                     "highest_price": p.highest_price,
+                    "lowest_price": p.lowest_price,
+                    "side": p.side.value if isinstance(p.side, OrderSide) else p.side,
                 }
                 for sym, p in self.positions.items()
             },
@@ -414,6 +539,8 @@ class VirtualLedger:
                     stop_loss=p.get("stop_loss"),
                     target=p.get("target"),
                     highest_price=p.get("highest_price", p["current_price"]),
+                    lowest_price=p.get("lowest_price", p["current_price"]),
+                    side=OrderSide(p.get("side", OrderSide.BUY.value)),
                     opened_at=p.get("opened_at", datetime.now().isoformat()),
                 )
 

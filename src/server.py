@@ -42,7 +42,7 @@ trading_agent = TradingAgent(
 
 # Autonomous trading loop controls
 auto_trading_enabled: bool = True
-cycle_interval_seconds: int = 15
+cycle_interval_seconds: int = 60
 _autonomous_task: Optional[asyncio.Task] = None
 
 

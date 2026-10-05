@@ -113,3 +113,44 @@ def test_persistence(ledger):
     assert loaded.cash_balance == ledger.cash_balance
     assert "RELIANCE.NS" in loaded.positions
     assert loaded.positions["RELIANCE.NS"].quantity == 1
+
+
+def test_intraday_short_selling_and_covering(ledger):
+    # Trying to sell unheld stock without allow_short should reject
+    rej = ledger.execute_order(
+        symbol="INFY.NS",
+        side=OrderSide.SELL,
+        quantity=2,
+        current_price=1000.0,
+        allow_short=False,
+    )
+    assert rej.status == OrderStatus.REJECTED
+
+    # Short selling with allow_short=True
+    short_res = ledger.execute_order(
+        symbol="INFY.NS",
+        side=OrderSide.SELL,
+        quantity=2,
+        current_price=1000.0,
+        stop_loss=1020.0,
+        target=960.0,
+        allow_short=True,
+    )
+    assert short_res.status == OrderStatus.FILLED
+    assert "INFY.NS" in ledger.positions
+    pos = ledger.positions["INFY.NS"]
+    assert pos.side == OrderSide.SELL
+    assert pos.quantity == 2
+
+    # Stock price drops to 950 (profitable short!)
+    cover_res = ledger.execute_order(
+        symbol="INFY.NS",
+        side=OrderSide.BUY,
+        quantity=2,
+        current_price=950.0,
+        reason="Target reached",
+    )
+    assert cover_res.status == OrderStatus.FILLED
+    assert "INFY.NS" not in ledger.positions
+    # Profit realized on short drop from 1000 to 950 (~90+ INR net)
+    assert ledger.realized_pnl > 0

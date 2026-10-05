@@ -48,3 +48,20 @@ def test_fetch_intraday_history():
     assert not df.empty
     assert "Close" in df.columns
     assert "Volume" in df.columns
+
+def test_intraday_history_caching():
+    provider = MarketDataProvider()
+    # First call populates cache
+    df1 = provider.get_intraday_history("RELIANCE.NS", interval="5m", period="5d")
+    cache_key = "RELIANCE.NS_5m_5d"
+    assert cache_key in provider._history_cache
+    # Second call uses cache
+    df2 = provider.get_intraday_history("RELIANCE.NS", interval="5m", period="5d")
+    assert len(df1) == len(df2)
+
+def test_screen_top_movers():
+    provider = MarketDataProvider()
+    top = provider.screen_top_movers(limit=5)
+    assert len(top) == 5
+    assert all(isinstance(s, str) for s in top)
+

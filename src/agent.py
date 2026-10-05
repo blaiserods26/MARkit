@@ -189,6 +189,41 @@ class TradingAgent:
         except Exception:
             pass
 
+        # ATR (Average True Range - 14 period)
+        atr = round(max(1.0, current_price * 0.01), 2)
+        if len(df) >= 15 and all(col in df.columns for col in ["High", "Low", "Close"]):
+            try:
+                high = df["High"]
+                low = df["Low"]
+                close_s = df["Close"]
+                tr1 = high - low
+                tr2 = (high - close_s.shift(1)).abs()
+                tr3 = (low - close_s.shift(1)).abs()
+                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                calculated_atr = float(tr.rolling(window=14).mean().iloc[-1])
+                if not pd.isna(calculated_atr) and calculated_atr > 0:
+                    atr = round(calculated_atr, 2)
+            except Exception:
+                pass
+
+        # Institutional Open=Low / Open=High (OHL) pattern
+        ohl_pattern = "NONE"
+        open_price = current_price
+        if len(df) >= 1 and all(col in df.columns for col in ["Open", "Low", "High"]):
+            try:
+                today_candles = df.iloc[-min(len(df), 12):]
+                first_open = float(today_candles["Open"].iloc[0])
+                day_low = float(today_candles["Low"].min())
+                day_high = float(today_candles["High"].max())
+                open_price = first_open
+                if first_open > 0:
+                    if (first_open - day_low) / first_open <= 0.0015:
+                        ohl_pattern = "OPEN_LOW"
+                    elif (day_high - first_open) / first_open <= 0.0015:
+                        ohl_pattern = "OPEN_HIGH"
+            except Exception:
+                pass
+
         return {
             "rsi": rsi,
             "ema_fast": round(float(ema_fast), 2),
@@ -197,6 +232,9 @@ class TradingAgent:
             "trend_15m": trend_15m,
             "vol_ratio": vol_ratio,
             "volatility": volatility,
+            "atr": atr,
+            "ohl_pattern": ohl_pattern,
+            "open_price": round(open_price, 2),
             "current_price": round(current_price, 2),
         }
 
@@ -238,10 +276,11 @@ class TradingAgent:
         sentiment: Dict,
         is_held: bool,
         held_position: Optional[Position] = None,
+        allow_short: bool = False,
     ) -> Optional[Dict]:
         """
         Query Gemini with full awareness of available cash, portfolio limits,
-        and inventory of stocks purchased before.
+        and inventory of stocks purchased before or shorted.
         """
         if self.gemini_rotator.key_count == 0:
             return None
@@ -254,16 +293,22 @@ class TradingAgent:
         held_summary = []
         for s, p in self.ledger.positions.items():
             held_summary.append(
-                f"- {s}: {p.quantity} shares @ avg ₹{p.average_entry_price:.2f} (Current: ₹{p.current_price:.2f}, Unrealized P&L: ₹{p.unrealized_pnl:+.2f})"
+                f"- {s} ({p.side.value}): {p.quantity} shares @ avg ₹{p.average_entry_price:.2f} (Current: ₹{p.current_price:.2f}, Unrealized P&L: ₹{p.unrealized_pnl:+.2f})"
             )
         held_text = "\n".join(held_summary) if held_summary else "None (No open positions)"
 
         headlines_text = "\n".join([f"- {h['title']}" for h in sentiment.get("headlines", [])[:3]])
 
         status_desc = (
-            f"PURCHASED BEFORE: Holding {held_position.quantity} shares (Entry: ₹{held_position.average_entry_price:.2f}, P&L: ₹{held_position.unrealized_pnl:+.2f})"
+            f"CURRENTLY HELD ({held_position.side.value}): Holding {held_position.quantity} shares (Entry: ₹{held_position.average_entry_price:.2f}, P&L: ₹{held_position.unrealized_pnl:+.2f})"
             if (is_held and held_position)
-            else "NOT PURCHASED BEFORE (Not currently held in portfolio)"
+            else "NOT CURRENTLY HELD (Not in portfolio)"
+        )
+
+        short_rule_desc = (
+            "   - Market regime is BEARISH: You ARE permitted to recommend SELL on unheld stocks to enter an intraday short (MIS) position on breakdowns (sized up to max buy qty).\n"
+            if allow_short
+            else "   - You can ONLY SELL if the stock was PURCHASED BEFORE and is listed in Currently Held Positions above!\n   - Under NO circumstances can you sell an unheld stock when market regime is not bearish.\n"
         )
 
         prompt = f"""You are an autonomous Indian Stock Market (NSE) Day Trader running an INTRADAY ONLY strategy.
@@ -272,10 +317,10 @@ FINANCIAL PORTFOLIO STATE:
 - Total Portfolio Equity: ₹{total_equity:.2f} INR
 - Available Cash Remaining: ₹{available_cash:.2f} INR
 - Max Position Allocation Ceiling (30% max): ₹{round(total_equity * self.ledger.max_allocation_pct, 2):.2f} INR
-- Maximum Allowable Purchase Value for this order: ₹{max_order_val:.2f} INR
-- Maximum Buy Quantity within Budget: {max_buy_qty} shares at ₹{price:.2f}
+- Maximum Allowable Order Value for this position: ₹{max_order_val:.2f} INR
+- Maximum Quantity within Budget: {max_buy_qty} shares at ₹{price:.2f}
 
-CURRENTLY HELD POSITIONS (Stocks Purchased Before):
+CURRENTLY HELD POSITIONS:
 {held_text}
 
 EVALUATING SYMBOL: {symbol}
@@ -285,6 +330,8 @@ EVALUATING SYMBOL: {symbol}
   * RSI (14): {technicals.get('rsi')}
   * Trend: {technicals.get('trend')} (EMA9: ₹{technicals.get('ema_fast')}, EMA21: ₹{technicals.get('ema_slow')})
   * Volatility: {technicals.get('volatility')}
+  * ATR: ₹{technicals.get('atr')}
+  * OHL Pattern: {technicals.get('ohl_pattern')}
 - News Sentiment: {sentiment.get('rating')} (Score: {sentiment.get('sentiment')})
 Recent Headlines:
 {headlines_text or "No immediate news"}
@@ -292,25 +339,22 @@ Recent Headlines:
 STRICT TRADING RULES:
 1. INTRADAY ONLY: All trades are intraday. All positions will be squared off before market close.
 2. BUY RULES:
-   - Allowed ONLY if the stock is NOT currently held.
-   - The purchase order MUST be strictly limited to the remaining allowable value of ₹{max_order_val:.2f} (maximum {max_buy_qty} shares).
-   - If max_buy_qty <= 0 or remaining cash is insufficient, you MUST choose HOLD.
+   - If stock is not held, recommend BUY for strong bullish setups with target and stop loss.
+   - If stock is held SHORT, recommend BUY to cover short.
+   - Sizing strictly limited to {max_buy_qty} shares (order value <= ₹{max_order_val:.2f}).
 3. SELL RULES:
-   - You can ONLY SELL if the stock was PURCHASED BEFORE and is listed in Currently Held Positions above!
-   - Under NO circumstances can you sell an unheld stock (no naked short selling).
-   - If holding the stock, recommend SELL to take profit, cut loss, or if technical momentum breaks down.
+{short_rule_desc}   - If holding a LONG position, recommend SELL to take profit or cut loss.
 4. DEBIT / CREDIT ACCOUNTING:
-   - Purchasing debits cash by order cost + statutory charges.
-   - Selling credits proceeds back into available cash.
+   - Buying debits cash; selling long credits proceeds; opening short holds margin; covering short releases margin and settles P&L.
 
 Respond with a JSON object in this exact format:
 {{
   "action": "BUY" | "SELL" | "HOLD",
-  "quantity": <integer: 1 to {max_buy_qty} for BUY, or 1 to {held_position.quantity if (is_held and held_position) else 0} for SELL, or 0 for HOLD>,
+  "quantity": <integer: 1 to {max_buy_qty} for BUY/SHORT, or 1 to {held_position.quantity if (is_held and held_position) else 0} for exit, or 0 for HOLD>,
   "confidence": <float between 0.0 and 1.0>,
   "target_price": <float target or null>,
   "stop_loss": <float stop loss or null>,
-  "thesis": "<1-2 sentence trade thesis explicitly explaining how this fits within the remaining cash budget of ₹{available_cash:.2f} and intraday rules>"
+  "thesis": "<1-2 sentence trade thesis explicitly explaining how this fits within the remaining budget and intraday rules>"
 }}"""
 
         raw_response = self.gemini_rotator.generate_text(prompt)
@@ -329,14 +373,17 @@ Respond with a JSON object in this exact format:
         is_held: Optional[bool] = None,
         held_position: Optional[Position] = None,
         current_dt: Optional[datetime] = None,
+        allow_short: bool = False,
     ) -> AgentDecision:
         """
         Evaluate a stock setup with full financial context:
-        - Stocks NOT purchased before can ONLY be bought or held (SELL strictly prohibited).
+        - Stocks NOT purchased before can ONLY be bought or held (SELL strictly prohibited unless allow_short=True in bearish regime).
         - Stocks PURCHASED BEFORE can be sold or held.
+        - Stocks SHORTED BEFORE can be covered (BUY) or held.
         - Buy sizing strictly limited to remaining allowable cash budget.
         - Enforces minimum dwell time to prevent whipsaw indicator jitter.
-        - Enforces minimum 1:2 Risk:Reward ratio before BUY.
+        - Enforces dynamic ATR stop-loss (1.5x ATR) and target (3.0x ATR) preserving >= 1:2 R:R.
+        - Detects institutional Open=Low (bullish boost) and Open=High (bearish filter).
         - Multi-timeframe trend & volume confirmation.
         """
         if is_held is None:
@@ -388,63 +435,114 @@ Respond with a JSON object in this exact format:
                 dwell_seconds = 999999.0
 
         if is_held and held_position:
-            # STOCK WAS PURCHASED BEFORE: Evaluate for SELL or HOLD
+            # STOCK WAS PURCHASED OR SHORTED BEFORE: Evaluate for EXIT or HOLD
             pnl_pct = held_position.unrealized_pnl_pct
-            is_hard_stop = (pnl_pct <= -1.0) or (held_position.stop_loss is not None and price <= held_position.stop_loss)
-            is_target_hit = (pnl_pct >= 2.5) or (held_position.target is not None and price >= held_position.target)
 
-            # Prevent whipsaw / panic exits during minimum dwell time unless hard stop/target is hit
-            if dwell_seconds < self.min_dwell_seconds and not (is_hard_stop or is_target_hit):
-                action = ActionType.HOLD
-                confidence = 0.65
-                quantity = 0
-                reasoning_parts.append(
-                    f"Holding {symbol} ({held_position.quantity} shares): In minimum dwell window ({int(dwell_seconds)}s / {self.min_dwell_seconds}s). Protecting against whipsaw indicator jitter. P&L={pnl_pct:+.2f}%."
-                )
-            elif is_hard_stop or is_target_hit or trend == "BEARISH" or sentiment_rating == SentimentRating.BEARISH:
-                action = ActionType.SELL
-                confidence = 0.80 + (0.10 if is_hard_stop else 0.0)
-                quantity = held_position.quantity
-                reasoning_parts.append(
-                    f"Intraday SELL signal on held stock {symbol}: HardStop={is_hard_stop}, TargetHit={is_target_hit}, Trend={trend}, RSI={rsi}, Sentiment={sentiment_rating}, P&L={pnl_pct:+.2f}%."
-                )
+            if held_position.side == OrderSide.BUY:
+                # LONG POSITION EXIT LOGIC
+                is_hard_stop = (pnl_pct <= -1.0) or (held_position.stop_loss is not None and price <= held_position.stop_loss)
+                is_target_hit = (pnl_pct >= 2.5) or (held_position.target is not None and price >= held_position.target)
+
+                # Prevent whipsaw / panic exits during minimum dwell time unless hard stop/target is hit
+                if dwell_seconds < self.min_dwell_seconds and not (is_hard_stop or is_target_hit):
+                    action = ActionType.HOLD
+                    confidence = 0.65
+                    quantity = 0
+                    reasoning_parts.append(
+                        f"Holding {symbol} ({held_position.quantity} shares): In minimum dwell window ({int(dwell_seconds)}s / {self.min_dwell_seconds}s). Protecting against whipsaw indicator jitter. P&L={pnl_pct:+.2f}%."
+                    )
+                elif is_hard_stop or is_target_hit or trend == "BEARISH" or sentiment_rating == SentimentRating.BEARISH:
+                    action = ActionType.SELL
+                    confidence = 0.80 + (0.10 if is_hard_stop else 0.0)
+                    quantity = held_position.quantity
+                    reasoning_parts.append(
+                        f"Intraday SELL signal on held stock {symbol}: HardStop={is_hard_stop}, TargetHit={is_target_hit}, Trend={trend}, RSI={rsi}, Sentiment={sentiment_rating}, P&L={pnl_pct:+.2f}%."
+                    )
+                else:
+                    action = ActionType.HOLD
+                    confidence = 0.60
+                    quantity = 0
+                    reasoning_parts.append(
+                        f"Holding {symbol} ({held_position.quantity} shares): Trend={trend}, RSI={rsi}, P&L={pnl_pct:+.2f}%. Position stable."
+                    )
             else:
-                action = ActionType.HOLD
-                confidence = 0.60
-                quantity = 0
-                reasoning_parts.append(
-                    f"Holding {symbol} ({held_position.quantity} shares): Trend={trend}, RSI={rsi}, P&L={pnl_pct:+.2f}%. Position stable."
-                )
+                # SHORT POSITION COVER LOGIC (held_position.side == OrderSide.SELL)
+                is_hard_stop = (pnl_pct <= -1.0) or (held_position.stop_loss is not None and price >= held_position.stop_loss)
+                is_target_hit = (pnl_pct >= 2.5) or (held_position.target is not None and price <= held_position.target)
+
+                if dwell_seconds < self.min_dwell_seconds and not (is_hard_stop or is_target_hit):
+                    action = ActionType.HOLD
+                    confidence = 0.65
+                    quantity = 0
+                    reasoning_parts.append(
+                        f"Holding SHORT {symbol} ({held_position.quantity} shares): In minimum dwell window ({int(dwell_seconds)}s / {self.min_dwell_seconds}s). P&L={pnl_pct:+.2f}%."
+                    )
+                elif is_hard_stop or is_target_hit or trend == "BULLISH" or sentiment_rating == SentimentRating.BULLISH:
+                    action = ActionType.BUY
+                    confidence = 0.80 + (0.10 if is_hard_stop else 0.0)
+                    quantity = held_position.quantity
+                    reasoning_parts.append(
+                        f"Intraday SHORT COVER signal on {symbol}: HardStop={is_hard_stop}, TargetHit={is_target_hit}, Trend={trend}, RSI={rsi}, Sentiment={sentiment_rating}, P&L={pnl_pct:+.2f}%."
+                    )
+                else:
+                    action = ActionType.HOLD
+                    confidence = 0.60
+                    quantity = 0
+                    reasoning_parts.append(
+                        f"Holding SHORT {symbol} ({held_position.quantity} shares): Trend={trend}, RSI={rsi}, P&L={pnl_pct:+.2f}%. Short position stable."
+                    )
         else:
-            # STOCK WAS NOT PURCHASED BEFORE: Evaluate for BUY or HOLD (CANNOT SELL!)
+            # STOCK WAS NOT CURRENTLY HELD: Evaluate for BUY, SHORT (if allowed), or HOLD
             trend_15m = technicals.get("trend_15m", "SIDEWAYS")
             vol_ratio = technicals.get("vol_ratio", 1.0)
+            atr = technicals.get("atr", round(max(1.0, price * 0.01), 2))
+            ohl_pattern = technicals.get("ohl_pattern", "NONE")
+            open_price = technicals.get("open_price", price)
 
-            # Multi-timeframe trend & volume confirmation
+            # Multi-timeframe trend & volume confirmation for BUY setup
             is_technical_bullish = (
                 trend == "BULLISH"
+                and ohl_pattern != "OPEN_HIGH"  # Filter out bearish institutional pressure
                 and trend_15m in ("BULLISH", "SIDEWAYS")
                 and (rsi < 65)
                 and (vol_ratio >= 0.75)
                 and sentiment_rating != SentimentRating.BEARISH
             )
 
+            # Breakdown confirmation for SHORT setup (only if allow_short is True)
+            is_technical_bearish = (
+                allow_short
+                and trend == "BEARISH"
+                and ohl_pattern != "OPEN_LOW"  # Filter out bullish institutional support
+                and trend_15m in ("BEARISH", "SIDEWAYS")
+                and (rsi > 35)
+                and (vol_ratio >= 0.75)
+                and sentiment_rating != SentimentRating.BULLISH
+            )
+
             if is_technical_bullish:
-                # Minimum 1:2 Risk to Reward requirement
-                candidate_sl = round(price * 0.99, 2)       # 1.0% stop-loss
-                candidate_target = round(price * 1.025, 2)  # 2.5% target
+                # Dynamic ATR Stop-Loss (1.5x ATR) and Target (3.0x ATR)
+                candidate_sl = round(price - 1.5 * atr, 2)
+                candidate_target = round(price + 3.0 * atr, 2)
+                if ohl_pattern == "OPEN_LOW" and open_price < price:
+                    # Anchor stop loss above open price if tighter
+                    candidate_sl = max(candidate_sl, round(open_price - 0.5, 2))
+
                 risk = price - candidate_sl
                 reward = candidate_target - price
                 rr_ratio = reward / risk if risk > 0 else 0.0
 
-                if rr_ratio >= 2.0 and max_buy_qty > 0 and available_cash >= price:
+                if rr_ratio >= 1.8 and max_buy_qty > 0 and available_cash >= price:
                     action = ActionType.BUY
-                    confidence = 0.75 + (0.15 if sentiment_rating == SentimentRating.BULLISH else 0.0)
+                    base_conf = 0.75 + (0.15 if sentiment_rating == SentimentRating.BULLISH else 0.0)
+                    if ohl_pattern == "OPEN_LOW":
+                        base_conf += 0.10
+                    confidence = min(0.95, base_conf)
                     quantity = max_buy_qty
                     stop_loss = candidate_sl
                     target_price = candidate_target
                     reasoning_parts.append(
-                        f"Bullish setup for {symbol}: 5m Trend={trend}, 15m Trend={trend_15m}, VolRatio={vol_ratio}, RSI={rsi}. "
+                        f"Bullish setup for {symbol}: 5m Trend={trend}, 15m Trend={trend_15m}, VolRatio={vol_ratio}, RSI={rsi}, ATR=₹{atr:.2f}, OHL={ohl_pattern}. "
                         f"R:R={rr_ratio:.1f}:1. Sized to {quantity} shares (₹{quantity * price:.2f} <= ₹{max_order_val:.2f} budget limit)."
                     )
                 else:
@@ -453,11 +551,39 @@ Respond with a JSON object in this exact format:
                     reasoning_parts.append(
                         f"Bullish signal for {symbol}, but purchase order halted: R:R={rr_ratio:.1f}:1 or budget limit reached."
                     )
+            elif is_technical_bearish:
+                # Dynamic ATR Short Stop-Loss (1.5x ATR above price) and Target (3.0x ATR below price)
+                candidate_sl = round(price + 1.5 * atr, 2)
+                candidate_target = round(price - 3.0 * atr, 2)
+                if ohl_pattern == "OPEN_HIGH" and open_price > price:
+                    candidate_sl = min(candidate_sl, round(open_price + 0.5, 2))
+
+                risk = candidate_sl - price
+                reward = price - candidate_target
+                rr_ratio = reward / risk if risk > 0 else 0.0
+
+                if rr_ratio >= 1.8 and max_buy_qty > 0 and available_cash >= price:
+                    action = ActionType.SELL
+                    base_conf = 0.75 + (0.10 if ohl_pattern == "OPEN_HIGH" else 0.0)
+                    confidence = min(0.95, base_conf)
+                    quantity = max_buy_qty
+                    stop_loss = candidate_sl
+                    target_price = candidate_target
+                    reasoning_parts.append(
+                        f"Intraday Short setup (MIS) for {symbol}: 5m Trend={trend}, 15m={trend_15m}, VolRatio={vol_ratio}, RSI={rsi}, ATR=₹{atr:.2f}, OHL={ohl_pattern}. "
+                        f"R:R={rr_ratio:.1f}:1. Sized to {quantity} shares."
+                    )
+                else:
+                    action = ActionType.HOLD
+                    confidence = 0.40
+                    reasoning_parts.append(
+                        f"Bearish breakdown on {symbol}, but short entry halted: R:R={rr_ratio:.1f}:1 or margin limit reached."
+                    )
             else:
                 action = ActionType.HOLD
                 confidence = 0.50
                 reasoning_parts.append(
-                    f"Neutral/Bearish on unheld stock {symbol} (5m={trend}, 15m={trend_15m}, RSI={rsi}, Vol={vol_ratio}). Holding."
+                    f"Neutral/Consolidating on unheld stock {symbol} (5m={trend}, 15m={trend_15m}, RSI={rsi}, Vol={vol_ratio}, OHL={ohl_pattern}). Holding."
                 )
 
         # AI Synthesis with Gemini: Only synthesize when an action setup (BUY or SELL) is triggered
@@ -470,6 +596,7 @@ Respond with a JSON object in this exact format:
                 sentiment=research,
                 is_held=bool(is_held),
                 held_position=held_position,
+                allow_short=allow_short,
             )
 
         ai_thesis = None
@@ -482,26 +609,36 @@ Respond with a JSON object in this exact format:
             ai_qty = int(ai_decision.get("quantity", 0))
 
             # Enforce strict domain guardrails:
-            # 1. Cannot SELL unheld stock (stocks must be purchased before selling)
-            if ai_action_str == "SELL" and not is_held:
-                logger.warning(f"AI proposed SELL on unheld stock {symbol}. Blocked: stock was not purchased before.")
+            # 1. Cannot SELL unheld stock unless shorting is allowed
+            if ai_action_str == "SELL" and not is_held and not allow_short:
+                logger.warning(f"AI proposed SELL on unheld stock {symbol}. Blocked: stock was not purchased before and shorting disabled.")
                 ai_action_str = "HOLD"
                 ai_qty = 0
 
-            # 2. Cannot BUY if already held (avoid duplicate position bloat)
-            if ai_action_str == "BUY" and is_held:
+            # 2. Cannot BUY if already held LONG (avoid duplicate position bloat)
+            if ai_action_str == "BUY" and is_held and held_position and held_position.side == OrderSide.BUY:
                 ai_action_str = "HOLD"
                 ai_qty = 0
 
             # 3. BUY quantity strictly capped by remaining allowable cash value
-            if ai_action_str == "BUY":
+            if ai_action_str == "BUY" and (not is_held or (held_position and held_position.side != OrderSide.SELL)):
                 ai_qty = min(max_buy_qty, max(1, ai_qty if ai_qty > 0 else max_buy_qty))
                 if ai_qty <= 0 or (ai_qty * price) > available_cash:
                     ai_action_str = "HOLD"
                     ai_qty = 0
 
-            # 4. SELL quantity capped by held position inventory
-            if ai_action_str == "SELL" and is_held and held_position:
+            # 4. SELL quantity capped by held position inventory (for long exits) or margin (for short opens)
+            if ai_action_str == "SELL":
+                if is_held and held_position and held_position.side == OrderSide.BUY:
+                    ai_qty = min(held_position.quantity, max(1, ai_qty if ai_qty > 0 else held_position.quantity))
+                elif not is_held and allow_short:
+                    ai_qty = min(max_buy_qty, max(1, ai_qty if ai_qty > 0 else max_buy_qty))
+                    if ai_qty <= 0 or (ai_qty * price) > available_cash:
+                        ai_action_str = "HOLD"
+                        ai_qty = 0
+
+            # 5. BUY quantity for short covering capped by held short quantity
+            if ai_action_str == "BUY" and is_held and held_position and held_position.side == OrderSide.SELL:
                 ai_qty = min(held_position.quantity, max(1, ai_qty if ai_qty > 0 else held_position.quantity))
 
             if ai_action_str in ("BUY", "SELL", "HOLD"):
@@ -541,7 +678,7 @@ Respond with a JSON object in this exact format:
     def monitor_open_positions(self, current_dt: Optional[datetime] = None) -> List[TradeResult]:
         """
         Check active positions against stop-loss, dynamic trailing stops, and profit targets.
-        When stop/target triggers, proceeds are credited to cash.
+        Supports both LONG positions (exited via SELL) and SHORT positions (exited via BUY).
         """
         results: List[TradeResult] = []
         now_dt = current_dt or self.clock.now()
@@ -557,46 +694,80 @@ Respond with a JSON object in this exact format:
             new_sl = pos.check_trailing_stop(activation_gain_pct=0.015, trail_distance_pct=0.0075)
             if new_sl:
                 self.log_thought(
-                    thought=f"TRAILING STOP RAISED: {symbol} trailing stop set to ₹{new_sl:.2f} (Locking in profit from peak ₹{pos.highest_price:.2f}).",
+                    thought=f"TRAILING STOP ADJUSTED: {symbol} trailing stop set to ₹{new_sl:.2f} (Locking in profit).",
                     action="TRAILING_STOP_UPDATE",
-                    details={"symbol": symbol, "trailing_stop": new_sl, "highest_price": pos.highest_price},
+                    details={"symbol": symbol, "trailing_stop": new_sl, "side": pos.side.value},
                 )
 
-            # Stop loss hit (fixed or trailing)
-            if pos.stop_loss and current_price <= pos.stop_loss:
-                res = self.ledger.execute_order(
-                    symbol=symbol,
-                    side=OrderSide.SELL,
-                    quantity=pos.quantity,
-                    current_price=current_price,
-                    reason=f"Stop/Trailing Stop Loss Hit at ₹{current_price} (SL: ₹{pos.stop_loss})",
-                )
-                if res.status == OrderStatus.FILLED and res.trade:
-                    self.symbol_cooldowns[symbol] = now_dt
-                    self.log_thought(
-                        thought=f"STOP LOSS HIT: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
-                        action="RISK_EXIT",
-                        details=asdict(res.trade),
+            # LONG POSITION (side == OrderSide.BUY)
+            if pos.side == OrderSide.BUY:
+                if pos.stop_loss and current_price <= pos.stop_loss:
+                    res = self.ledger.execute_order(
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        quantity=pos.quantity,
+                        current_price=current_price,
+                        reason=f"Stop/Trailing Stop Loss Hit at ₹{current_price} (SL: ₹{pos.stop_loss})",
                     )
-                    results.append(res)
+                    if res.status == OrderStatus.FILLED and res.trade:
+                        self.symbol_cooldowns[symbol] = now_dt
+                        self.log_thought(
+                            thought=f"STOP LOSS HIT: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
+                            action="RISK_EXIT",
+                            details=asdict(res.trade),
+                        )
+                        results.append(res)
+                elif pos.target and current_price >= pos.target:
+                    res = self.ledger.execute_order(
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        quantity=pos.quantity,
+                        current_price=current_price,
+                        reason=f"Profit Target Reached at ₹{current_price} (TP: ₹{pos.target})",
+                    )
+                    if res.status == OrderStatus.FILLED and res.trade:
+                        self.symbol_cooldowns[symbol] = now_dt
+                        self.log_thought(
+                            thought=f"PROFIT TARGET REACHED: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
+                            action="TARGET_EXIT",
+                            details=asdict(res.trade),
+                        )
+                        results.append(res)
 
-            # Target hit
-            elif pos.target and current_price >= pos.target:
-                res = self.ledger.execute_order(
-                    symbol=symbol,
-                    side=OrderSide.SELL,
-                    quantity=pos.quantity,
-                    current_price=current_price,
-                    reason=f"Profit Target Reached at ₹{current_price} (TP: ₹{pos.target})",
-                )
-                if res.status == OrderStatus.FILLED and res.trade:
-                    self.symbol_cooldowns[symbol] = now_dt
-                    self.log_thought(
-                        thought=f"PROFIT TARGET REACHED: Sold {pos.quantity} {symbol} @ ₹{current_price}. Cash Credited: ₹{res.trade.net_amount:.2f}. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
-                        action="TARGET_EXIT",
-                        details=asdict(res.trade),
+            # SHORT POSITION (side == OrderSide.SELL)
+            else:
+                if pos.stop_loss and current_price >= pos.stop_loss:
+                    res = self.ledger.execute_order(
+                        symbol=symbol,
+                        side=OrderSide.BUY,
+                        quantity=pos.quantity,
+                        current_price=current_price,
+                        reason=f"Short Stop Loss Hit at ₹{current_price} (SL: ₹{pos.stop_loss})",
                     )
-                    results.append(res)
+                    if res.status == OrderStatus.FILLED and res.trade:
+                        self.symbol_cooldowns[symbol] = now_dt
+                        self.log_thought(
+                            thought=f"SHORT STOP HIT: Covered {pos.quantity} {symbol} @ ₹{current_price}. Margin Released. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
+                            action="RISK_EXIT",
+                            details=asdict(res.trade),
+                        )
+                        results.append(res)
+                elif pos.target and current_price <= pos.target:
+                    res = self.ledger.execute_order(
+                        symbol=symbol,
+                        side=OrderSide.BUY,
+                        quantity=pos.quantity,
+                        current_price=current_price,
+                        reason=f"Short Profit Target Reached at ₹{current_price} (TP: ₹{pos.target})",
+                    )
+                    if res.status == OrderStatus.FILLED and res.trade:
+                        self.symbol_cooldowns[symbol] = now_dt
+                        self.log_thought(
+                            thought=f"SHORT PROFIT TARGET REACHED: Covered {pos.quantity} {symbol} @ ₹{current_price}. Margin Released. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Remaining: ₹{self.ledger.cash_balance:.2f}.",
+                            action="TARGET_EXIT",
+                            details=asdict(res.trade),
+                        )
+                        results.append(res)
 
         return results
 
@@ -767,15 +938,16 @@ Provide a concise post-market analysis (3-4 bullet points):
             if tr.trade:
                 cycle_result["trades_executed"].append(asdict(tr.trade))
 
-        # Step 3B: Evaluate currently held positions (purchased before) for AI / technical SELL signals
+        # Step 3B: Evaluate currently held positions for AI / technical exit signals
         for sym, pos in list(self.ledger.positions.items()):
             decision = self.evaluate_opportunity(sym, is_held=True, held_position=pos, current_dt=current_dt)
             self.log_thought(
-                thought=f"Evaluated held position {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. {decision.reasoning}",
+                thought=f"Evaluated held position {sym} ({pos.side.value}): Action={decision.action.value}, Conf={decision.confidence:.2f}. {decision.reasoning}",
                 action="POSITION_EVALUATION",
-                details={"symbol": sym, "action": decision.action.value, "confidence": decision.confidence},
+                details={"symbol": sym, "action": decision.action.value, "confidence": decision.confidence, "side": pos.side.value},
             )
-            if decision.action == ActionType.SELL and decision.confidence >= 0.65:
+            # LONG EXIT: pos.side == OrderSide.BUY, exit via SELL
+            if pos.side == OrderSide.BUY and decision.action == ActionType.SELL and decision.confidence >= 0.65:
                 quote = self.market_data.get_live_quote(sym)
                 price = quote.price if quote else pos.current_price
                 sell_qty = decision.quantity if decision.quantity > 0 else pos.quantity
@@ -795,6 +967,27 @@ Provide a concise post-market analysis (3-4 bullet points):
                     )
                     cycle_result["trades_executed"].append(asdict(res.trade))
 
+            # SHORT COVER: pos.side == OrderSide.SELL, exit via BUY
+            elif pos.side == OrderSide.SELL and decision.action == ActionType.BUY and decision.confidence >= 0.65:
+                quote = self.market_data.get_live_quote(sym)
+                price = quote.price if quote else pos.current_price
+                buy_qty = decision.quantity if decision.quantity > 0 else pos.quantity
+                res = self.ledger.execute_order(
+                    symbol=sym,
+                    side=OrderSide.BUY,
+                    quantity=buy_qty,
+                    current_price=price,
+                    reason=f"AI/Technical Intraday Short Cover: {decision.reasoning}",
+                )
+                if res.status == OrderStatus.FILLED and res.trade:
+                    self.symbol_cooldowns[sym] = current_dt
+                    self.log_thought(
+                        thought=f"SHORT COVERED: Bought {buy_qty} {sym} @ ₹{res.filled_price}. Margin Released. Realized P&L: ₹{res.trade.pnl:+.2f}. Updated Cash Balance: ₹{self.ledger.cash_balance:.2f}.",
+                        action="EXECUTION_COVER",
+                        details=asdict(res.trade),
+                    )
+                    cycle_result["trades_executed"].append(asdict(res.trade))
+
         # Step 3C: Check circuit breaker
         if self.ledger.circuit_breaker_triggered:
             self.log_thought(
@@ -804,7 +997,7 @@ Provide a concise post-market analysis (3-4 bullet points):
             cycle_result["status"] = "CIRCUIT_BREAKER_HALT"
             return cycle_result
 
-        # Step 3D: Timing gates and daily trade limit check before scanning BUY opportunities
+        # Step 3D: Timing gates and daily trade limit check before scanning BUY / SHORT opportunities
         can_enter, entry_reason = self.clock.is_entry_allowed(current_dt)
         today_buys = [
             t for t in self.ledger.trades
@@ -813,77 +1006,107 @@ Provide a concise post-market analysis (3-4 bullet points):
 
         if not can_enter:
             self.log_thought(
-                thought=f"ENTRY CUTOFF ACTIVE: {entry_reason}. Scanning for new BUY positions halted.",
+                thought=f"ENTRY CUTOFF ACTIVE: {entry_reason}. Scanning for new positions halted.",
                 action="ENTRY_CUTOFF_HALT",
             )
         elif len(today_buys) >= self.max_daily_trades:
             self.log_thought(
-                thought=f"DAILY TRADE LIMIT REACHED: {len(today_buys)}/{self.max_daily_trades} BUY orders executed today. Halting new entries to prevent friction bleed.",
+                thought=f"DAILY TRADE LIMIT REACHED: {len(today_buys)}/{self.max_daily_trades} orders executed today. Halting new entries to prevent friction bleed.",
                 action="DAILY_LIMIT_HALT",
             )
         elif len(self.ledger.positions) < 3 and self.ledger.cash_balance >= 300.0:
             regime = self.get_market_regime()
-            if regime.get("trend") == "BEARISH":
+            is_bearish = regime.get("trend") == "BEARISH"
+            if is_bearish:
                 self.log_thought(
-                    thought="MARKET REGIME BEARISH: Benchmark NIFTY 50 (^NSEI) is trending down (EMA9 < EMA21). Blocking new long entries.",
+                    thought="MARKET REGIME BEARISH: Benchmark NIFTY 50 (^NSEI) is trending down (EMA9 < EMA21). Enabling intraday short-selling (MIS) on breakdown leaders.",
                     action="REGIME_FILTER",
                     details=regime,
                 )
-            else:
-                symbols = self.market_data.get_nifty50_symbols()[:6]
-                for sym in symbols:
-                    if sym in self.ledger.positions:
-                        continue  # Already purchased before; skip to avoid duplicate entries
 
-                    # Check symbol cooldown (20 minutes after last exit)
-                    if sym in self.symbol_cooldowns:
-                        last_exit = self.symbol_cooldowns[sym]
-                        cur_compare = current_dt
-                        if last_exit.tzinfo is None and cur_compare.tzinfo is not None:
-                            last_exit = self.clock.tz.localize(last_exit)
-                        elif last_exit.tzinfo is not None and cur_compare.tzinfo is None:
-                            cur_compare = self.clock.tz.localize(cur_compare)
-                        elapsed_cd = (cur_compare - last_exit).total_seconds()
-                        if elapsed_cd < self.cooldown_seconds:
+            # Dynamic Nifty 50 RVOL and momentum screener
+            symbols = self.market_data.screen_top_movers(limit=6)
+            for sym in symbols:
+                if sym in self.ledger.positions:
+                    continue  # Already held; skip to avoid duplicate entries
+
+                # Check symbol cooldown (20 minutes after last exit)
+                if sym in self.symbol_cooldowns:
+                    last_exit = self.symbol_cooldowns[sym]
+                    cur_compare = current_dt
+                    if last_exit.tzinfo is None and cur_compare.tzinfo is not None:
+                        last_exit = self.clock.tz.localize(last_exit)
+                    elif last_exit.tzinfo is not None and cur_compare.tzinfo is None:
+                        cur_compare = self.clock.tz.localize(cur_compare)
+                    elapsed_cd = (cur_compare - last_exit).total_seconds()
+                    if elapsed_cd < self.cooldown_seconds:
+                        self.log_thought(
+                            thought=f"SYMBOL COOLDOWN ACTIVE: {sym} was exited {int(elapsed_cd)}s ago (< {self.cooldown_seconds}s). Skipping to prevent churn.",
+                            action="COOLDOWN_SKIP",
+                            details={"symbol": sym, "elapsed": elapsed_cd, "cooldown": self.cooldown_seconds},
+                        )
+                        continue
+
+                decision = self.evaluate_opportunity(
+                    sym,
+                    is_held=False,
+                    held_position=None,
+                    current_dt=current_dt,
+                    allow_short=is_bearish,
+                )
+                self.log_thought(
+                    thought=f"Evaluated {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. Sizing: {decision.quantity} shares. {decision.reasoning}",
+                    action="EVALUATION",
+                    details={
+                        "symbol": sym,
+                        "action": decision.action.value,
+                        "confidence": decision.confidence,
+                        "quantity": decision.quantity,
+                    },
+                )
+
+                if decision.action == ActionType.BUY and not is_bearish and decision.confidence >= 0.70 and decision.quantity > 0:
+                    quote = self.market_data.get_live_quote(sym)
+                    if quote:
+                        res = self.ledger.execute_order(
+                            symbol=sym,
+                            side=OrderSide.BUY,
+                            quantity=decision.quantity,
+                            current_price=quote.price,
+                            stop_loss=decision.stop_loss,
+                            target=decision.target_price,
+                            reason=f"AI Trade Setup: {decision.reasoning}",
+                        )
+                        if res.status == OrderStatus.FILLED and res.trade:
                             self.log_thought(
-                                thought=f"SYMBOL COOLDOWN ACTIVE: {sym} was exited {int(elapsed_cd)}s ago (< {self.cooldown_seconds}s). Skipping to prevent churn.",
-                                action="COOLDOWN_SKIP",
-                                details={"symbol": sym, "elapsed": elapsed_cd, "cooldown": self.cooldown_seconds},
+                                thought=f"CASH DEBITED: Debited ₹{res.trade.net_amount:.2f} for purchasing {decision.quantity} {sym} @ ₹{res.filled_price}. Remaining Cash Balance: ₹{self.ledger.cash_balance:.2f}. SL: ₹{decision.stop_loss}, TP: ₹{decision.target_price}.",
+                                action="EXECUTION_BUY",
+                                details=asdict(res.trade),
                             )
-                            continue
+                            cycle_result["trades_executed"].append(asdict(res.trade))
+                            break  # Execute one high-conviction order per cycle
 
-                    decision = self.evaluate_opportunity(sym, is_held=False, held_position=None, current_dt=current_dt)
-                    self.log_thought(
-                        thought=f"Evaluated {sym}: Action={decision.action.value}, Conf={decision.confidence:.2f}. Sizing: {decision.quantity} shares. {decision.reasoning}",
-                        action="EVALUATION",
-                        details={
-                            "symbol": sym,
-                            "action": decision.action.value,
-                            "confidence": decision.confidence,
-                            "quantity": decision.quantity,
-                        },
-                    )
-
-                    if decision.action == ActionType.BUY and decision.confidence >= 0.70 and decision.quantity > 0:
-                        quote = self.market_data.get_live_quote(sym)
-                        if quote:
-                            res = self.ledger.execute_order(
-                                symbol=sym,
-                                side=OrderSide.BUY,
-                                quantity=decision.quantity,
-                                current_price=quote.price,
-                                stop_loss=decision.stop_loss,
-                                target=decision.target_price,
-                                reason=f"AI Trade Setup: {decision.reasoning}",
+                elif decision.action == ActionType.SELL and is_bearish and decision.confidence >= 0.70 and decision.quantity > 0:
+                    quote = self.market_data.get_live_quote(sym)
+                    if quote:
+                        res = self.ledger.execute_order(
+                            symbol=sym,
+                            side=OrderSide.SELL,
+                            quantity=decision.quantity,
+                            current_price=quote.price,
+                            stop_loss=decision.stop_loss,
+                            target=decision.target_price,
+                            allow_short=True,
+                            reason=f"Intraday Short Setup (MIS): {decision.reasoning}",
+                        )
+                        if res.status == OrderStatus.FILLED and res.trade:
+                            self.log_thought(
+                                thought=f"SHORT OPENED (MIS): Sold short {decision.quantity} {sym} @ ₹{res.filled_price}. Margin Held: ₹{res.trade.net_amount:.2f}. Remaining Cash Balance: ₹{self.ledger.cash_balance:.2f}. SL: ₹{decision.stop_loss}, TP: ₹{decision.target_price}.",
+                                action="EXECUTION_SHORT",
+                                details=asdict(res.trade),
                             )
-                            if res.status == OrderStatus.FILLED and res.trade:
-                                self.log_thought(
-                                    thought=f"CASH DEBITED: Debited ₹{res.trade.net_amount:.2f} for purchasing {decision.quantity} {sym} @ ₹{res.filled_price}. Remaining Cash Balance: ₹{self.ledger.cash_balance:.2f} (Purchase order strictly limited to budget ceiling). SL: ₹{decision.stop_loss}, TP: ₹{decision.target_price}.",
-                                    action="EXECUTION_BUY",
-                                    details=asdict(res.trade),
-                                )
-                                cycle_result["trades_executed"].append(asdict(res.trade))
-                                break  # Execute one high-conviction order per cycle
+                            cycle_result["trades_executed"].append(asdict(res.trade))
+                            break  # Execute one high-conviction order per cycle
 
         cycle_result["status"] = "ACTIVE_MARKET_CYCLE_COMPLETE"
         self.last_cycle_summary = cycle_result

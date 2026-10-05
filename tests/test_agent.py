@@ -272,3 +272,169 @@ def test_max_daily_trade_cap(agent):
     assert limit_logged is True
 
 
+def test_atr_dynamic_stops_and_rr(agent):
+    technicals = agent.compute_technicals("RELIANCE.NS")
+    assert "atr" in technicals
+    assert technicals["atr"] > 0
+    assert "ohl_pattern" in technicals
+
+    # In evaluate_opportunity for a candidate buy, stop loss and target are derived from ATR
+    decision = agent.evaluate_opportunity("RELIANCE.NS", is_held=False)
+    if decision.action == ActionType.BUY:
+        price = technicals["current_price"]
+        atr = technicals["atr"]
+        # Expected stop loss is below price, target above price
+        assert decision.stop_loss < price
+        assert decision.target_price > price
+        risk = price - decision.stop_loss
+        reward = decision.target_price - price
+        rr = reward / risk
+        assert rr >= 1.8
+
+
+def test_ohl_pattern_boost_and_filter(agent, monkeypatch):
+    from unittest.mock import MagicMock
+    from src.market_data import QuoteSnapshot
+    from src.research import SentimentRating
+
+    monkeypatch.setattr(agent, "generate_ai_decision", lambda *args, **kwargs: None)
+    mock_quote = QuoteSnapshot(
+        symbol="TCS.NS",
+        price=1000.0,
+        day_high=1020.0,
+        day_low=1000.0,
+        change_pct=1.5,
+        volume=500000,
+        timestamp=agent.clock.now(),
+        currency="INR",
+    )
+    monkeypatch.setattr(agent.market_data, "get_live_quote", lambda sym: mock_quote)
+    monkeypatch.setattr(agent.researcher, "generate_symbol_briefing", lambda sym: {
+        "rating": SentimentRating.NEUTRAL,
+        "sentiment": 0.1,
+        "headlines": [],
+    })
+
+    # Test Open=Low boost
+    monkeypatch.setattr(agent, "compute_technicals", lambda sym: {
+        "rsi": 55.0,
+        "trend": "BULLISH",
+        "trend_15m": "BULLISH",
+        "vol_ratio": 1.2,
+        "volatility": 0.01,
+        "atr": 10.0,
+        "ohl_pattern": "OPEN_LOW",
+        "open_price": 995.0,
+        "current_price": 1000.0,
+        "ema_fast": 995.0,
+        "ema_slow": 990.0,
+    })
+    dec_ol = agent.evaluate_opportunity("TCS.NS", is_held=False)
+    assert dec_ol.action == ActionType.BUY
+    assert dec_ol.confidence >= 0.85
+
+    # Test Open=High filter (should reject BUY)
+    monkeypatch.setattr(agent, "compute_technicals", lambda sym: {
+        "rsi": 55.0,
+        "trend": "BULLISH",
+        "trend_15m": "BULLISH",
+        "vol_ratio": 1.2,
+        "volatility": 0.01,
+        "atr": 10.0,
+        "ohl_pattern": "OPEN_HIGH",
+        "open_price": 1005.0,
+        "current_price": 1000.0,
+        "ema_fast": 995.0,
+        "ema_slow": 990.0,
+    })
+    dec_oh = agent.evaluate_opportunity("TCS.NS", is_held=False)
+    assert dec_oh.action != ActionType.BUY
+
+
+def test_bearish_regime_short_selling(agent, monkeypatch):
+    from src.market_data import QuoteSnapshot
+    from src.research import SentimentRating
+
+    monkeypatch.setattr(agent, "generate_ai_decision", lambda *args, **kwargs: None)
+    mock_quote = QuoteSnapshot(
+        symbol="INFY.NS",
+        price=1000.0,
+        day_high=1005.0,
+        day_low=985.0,
+        change_pct=-2.0,
+        volume=600000,
+        timestamp=agent.clock.now(),
+        currency="INR",
+    )
+    monkeypatch.setattr(agent.market_data, "get_live_quote", lambda sym: mock_quote)
+    monkeypatch.setattr(agent.researcher, "generate_symbol_briefing", lambda sym: {
+        "rating": SentimentRating.NEUTRAL,
+        "sentiment": -0.2,
+        "headlines": [],
+    })
+    monkeypatch.setattr(agent, "compute_technicals", lambda sym: {
+        "rsi": 42.0,
+        "trend": "BEARISH",
+        "trend_15m": "BEARISH",
+        "vol_ratio": 1.5,
+        "volatility": 0.015,
+        "atr": 12.0,
+        "ohl_pattern": "OPEN_HIGH",
+        "open_price": 1005.0,
+        "current_price": 1000.0,
+        "ema_fast": 995.0,
+        "ema_slow": 1010.0,
+    })
+
+    # Without allow_short: unheld stock cannot be sold
+    dec_no_short = agent.evaluate_opportunity("INFY.NS", is_held=False, allow_short=False)
+    assert dec_no_short.action != ActionType.SELL
+
+    # With allow_short=True in bearish breakdown: triggers SELL for short
+    dec_short = agent.evaluate_opportunity("INFY.NS", is_held=False, allow_short=True)
+    assert dec_short.action == ActionType.SELL
+    assert dec_short.stop_loss > 1000.0  # Stop above entry
+    assert dec_short.target_price < 1000.0  # Target below entry
+    assert dec_short.confidence >= 0.75
+
+
+def test_short_position_monitoring_and_covering(agent, monkeypatch):
+    from src.ledger import OrderSide, Position, OrderStatus
+    from src.market_data import QuoteSnapshot
+
+    # Create active short position
+    pos = Position(
+        symbol="SBIN.NS",
+        quantity=5,
+        average_entry_price=500.0,
+        current_price=500.0,
+        stop_loss=515.0,
+        target=470.0,
+        highest_price=500.0,
+        lowest_price=500.0,
+        side=OrderSide.SELL,
+    )
+    agent.ledger.positions["SBIN.NS"] = pos
+    agent.ledger.cash_balance = 7500.0  # Initial margin held
+
+    # Case 1: Target reached (price drops to 468 <= target 470)
+    mock_quote = QuoteSnapshot(
+        symbol="SBIN.NS",
+        price=468.0,
+        day_high=500.0,
+        day_low=465.0,
+        change_pct=-6.4,
+        volume=1000000,
+        timestamp=agent.clock.now(),
+        currency="INR",
+    )
+    monkeypatch.setattr(agent.market_data, "get_live_quote", lambda sym: mock_quote)
+
+    trades = agent.monitor_open_positions()
+    assert len(trades) == 1
+    assert trades[0].status == OrderStatus.FILLED
+    assert "SBIN.NS" not in agent.ledger.positions
+    assert trades[0].trade.pnl > 0  # Profited from short drop
+
+
+

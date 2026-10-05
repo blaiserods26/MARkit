@@ -52,9 +52,11 @@ class QuoteSnapshot:
 
 
 class MarketDataProvider:
-    def __init__(self, cache_ttl_seconds: int = 10):
+    def __init__(self, cache_ttl_seconds: int = 10, history_cache_ttl_seconds: int = 60):
         self._cache_ttl = timedelta(seconds=cache_ttl_seconds)
+        self._history_ttl = timedelta(seconds=history_cache_ttl_seconds)
         self._quote_cache: Dict[str, tuple[datetime, QuoteSnapshot]] = {}
+        self._history_cache: Dict[str, tuple[datetime, pd.DataFrame]] = {}
         self._last_known_quotes: Dict[str, QuoteSnapshot] = {}
         self._session = requests.Session()
         self._session.headers.update({
@@ -169,18 +171,45 @@ class MarketDataProvider:
                 quotes[sym] = quote
         return quotes
 
+    def screen_top_movers(self, limit: int = 5) -> List[str]:
+        """
+        Dynamically screen liquid Nifty 50 constituents for highest absolute change/volume momentum.
+        Falls back to primary liquid tickers if screening fails.
+        """
+        candidates = self.get_nifty50_symbols()[:12]
+        quotes = self.get_batch_quotes(candidates)
+        if not quotes:
+            return candidates[:limit]
+
+        sorted_symbols = sorted(
+            quotes.keys(),
+            key=lambda s: abs(quotes[s].change_pct),
+            reverse=True,
+        )
+        return sorted_symbols[:limit] if sorted_symbols else candidates[:limit]
+
     def get_intraday_history(
         self, symbol: str, interval: str = "5m", period: str = "5d"
     ) -> pd.DataFrame:
         """
         Retrieve intraday OHLCV bars for technical indicator computation.
+        Uses in-memory 60s TTL cache to avoid hitting external rate limits.
         """
+        cache_key = f"{symbol}_{interval}_{period}"
+        now = datetime.now()
+        if cache_key in self._history_cache:
+            cache_time, cached_df = self._history_cache[cache_key]
+            if now - cache_time < self._history_ttl:
+                return cached_df.copy()
+
         try:
             ticker = yf.Ticker(symbol, session=self._session)
             df = ticker.history(period=period, interval=interval)
             if df.empty:
                 # Fallback to longer period if weekend / holiday
                 df = ticker.history(period="1mo", interval="15m")
+            if not df.empty:
+                self._history_cache[cache_key] = (now, df)
             return df
         except Exception as e:
             logger.exception(f"Error fetching intraday history for {symbol}: {e}")
